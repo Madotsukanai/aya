@@ -12,6 +12,11 @@ cd aya
 make
 ```
 
+インストールする場合は、
+```
+sudo make install
+```
+
 ## 実装予定機能
 - 置換
 
