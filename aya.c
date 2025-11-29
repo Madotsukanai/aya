@@ -41,7 +41,7 @@ enum editorKey {
   SHIFT_ARROW_DOWN
 };
 
-enum editorHighLight {
+enum editorLight {
   HL_NORMAL = 0,
   HL_COMMENT,
   HL_MLCOMMENT,
@@ -49,13 +49,15 @@ enum editorHighLight {
   HL_KEYWORD2,
   HL_STRING,
   HL_NUMBER,
-  HL_MATCH
+  HL_MATCH,
+  HL_PREPROC,
+  HL_INCLUDE,
+  HL_DEFINE_NUMBER,
+  HL_DEFINE_STRING
 };
 
 #define HL_HIGHLIGHT_NUMBERS (1<<0)
 #define HL_HIGHLIGHT_STRINGS (1<<1)
-
-/*** data ***/
 
 struct editorSyntax {
   char *filetype;
@@ -66,6 +68,75 @@ struct editorSyntax {
   char *multiline_comment_end;
   int flags;
 };
+
+/*** filetypes ***/
+
+char *C_HL_extensions[] = { ".c", ".h", NULL };
+char *C_HL_keywords[] = {
+  "switch", "if", "while", "for", "break", "continue", "return", "else",
+  "struct", "union", "typedef", "static", "enum", "case",
+  "const", "volatile", "extern", "register", "sizeof", "goto", "do", "default",
+
+  "int|", "long|", "double|", "float|", "char|", "unsigned|", "signed|",
+  "void|", "short|", "_Bool|", "_Complex|", "_Imaginary|", NULL
+};
+
+char *cpp_HL_extensions[] = { ".cpp", ".hpp", ".cc", ".hh", NULL };
+char *cpp_HL_keywords[] = {
+    "switch", "if", "while", "for", "break", "continue", "return", "else",
+    "struct", "union", "typedef", "static", "enum", "case", "const", 
+    "volatile", "extern", "register", "sizeof", "goto", "do", "default",
+    "class", "public", "private", "protected", "template", "typename",
+    "try", "catch", "throw", "new", "delete", "this", "friend", "virtual",
+    "namespace", "using", "explicit", "operator", "asm", "export", "inline",
+    "mutable", "reinterpret_cast", "static_cast", "const_cast", "dynamic_cast",
+    "typeid", "wchar_t",
+
+    "int|", "long|", "double|", "float|", "char|", "unsigned|", "signed|",
+    "void|", "short|", "bool|", "auto|", "decltype|",
+    "true|", "false|", "nullptr|", NULL
+};
+
+char *python_HL_extensions[] = { ".py", NULL };
+char *python_HL_keywords[] = {
+    "and", "as", "assert", "break", "class", "continue", "def", "del",
+    "elif", "else", "except", "finally", "for", "from", "global",
+    "if", "import", "in", "is", "lambda", "nonlocal", "not", "or",
+    "pass", "raise", "return", "try", "while", "with", "yield",
+
+    "True|", "False|", "None|", "self|", "cls|",
+
+    "int|", "str|", "list|", "dict|", "set|", "tuple|", "print|", "range|",
+    "len|", "super|", NULL
+};
+
+struct editorSyntax HLDB[] = {
+  {
+    "c",
+    C_HL_extensions,
+    C_HL_keywords,
+    "//", "/*", "*/",
+    HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS
+  },
+  {
+    "cpp",
+    cpp_HL_extensions,
+    cpp_HL_keywords,
+    "//", "/*", "*/",
+    HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS
+  },
+  {
+    "python",
+    python_HL_extensions,
+    python_HL_keywords,
+    "#", "\"\"\"", "\"\"\"",
+    HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS
+  },
+};
+
+#define HLDB_ENTRIES (sizeof(HLDB) / sizeof(HLDB[0]))
+
+/*** data ***/
 
 typedef struct erow {
   int idx;
@@ -111,6 +182,8 @@ void editorClearSelection();
 int is_selected(int filerow, int cx);
 char *editorGetSelectedString();
 void editorDeleteSelection();
+void editorUpdateSyntax(erow *row);
+void editorSelectSyntaxHighlight();
 
 /*** terminal ***/
 
@@ -258,15 +331,226 @@ int getWindowSize(int *rows, int *cols) {
   }
 }
 
+int is_separator(int c) {
+  return isspace(c) || c == '\0' || strchr(",.()+-/*=~%<>[];", c) != NULL;
+}
+void editorUpdateSyntax(erow *row) {
+    row->hl = realloc(row->hl, row->rsize);
+    memset(row->hl, HL_NORMAL, row->rsize);
+    if (E.syntax == NULL) return;
+    char **keywords = E.syntax->keywords;
+    char *scs = E.syntax->singleline_comment_start;
+    char *mcs = E.syntax->multiline_comment_start;
+    char *mce = E.syntax->multiline_comment_end;
+    int scs_len = scs ? strlen(scs) : 0;
+    int mcs_len = mcs ? strlen(mcs) : 0;
+    int mce_len = mce ? strlen(mce) : 0;
+    int prev_sep = 1;
+    int in_string = 0;
+    int in_comment = (row->idx > 0 && E.row[row->idx - 1].hl_open_comment);
+        int i = 0;
+        while (i < row->rsize) {
+            char c = row->render[i];
+            unsigned char prev_hl = (i > 0) ? row->hl[i - 1] : HL_NORMAL;
+    
+            // Handle preprocessor directives (C/C++ specific)
+            if (E.syntax != NULL && (strcmp(E.syntax->filetype, "c") == 0 || strcmp(E.syntax->filetype, "cpp") == 0) && c == '#' && i == 0) {
+                int start_i = i;
+                memset(&row->hl[start_i], HL_PREPROC, row->rsize - start_i); // Default to HL_PREPROC for the whole line
+    
+                // Find the directive word (e.g., "include", "define")
+                int j = start_i + 1; // Skip '#'
+                while (j < row->rsize && isspace(row->render[j])) j++; // Skip whitespace
+                int directive_start = j;
+                while (j < row->rsize && isalpha(row->render[j])) j++; // Read directive word
+                int directive_end = j;
+    
+                char directive[32];
+                int directive_len = directive_end - directive_start;
+                if (directive_len > 0 && (size_t)directive_len < sizeof(directive)) {
+                    strncpy(directive, &row->render[directive_start], directive_len);
+                    directive[directive_len] = '\0';
+    
+                    if (strcmp(directive, "include") == 0) {
+                        // Highlight include path
+                        while (j < row->rsize && isspace(row->render[j])) j++; // Skip whitespace
+                        if (row->render[j] == '<' || row->render[j] == '"') {
+                            int include_start = j;
+                            char opener = row->render[j];
+                            char closer = (opener == '<') ? '>' : '"';
+                            j++; // Skip opener
+                            while (j < row->rsize && row->render[j] != closer) j++; // Find closer
+                            if (j < row->rsize && row->render[j] == closer) {
+                                j++; // Include closer
+                            }
+                            memset(&row->hl[include_start], HL_INCLUDE, j - include_start);
+                        }
+                                    } else if (strcmp(directive, "define") == 0) {
+                                        // Skip macro name
+                                        while (j < row->rsize && isspace(row->render[j])) j++;
+                                        while (j < row->rsize && (isalnum(row->render[j]) || row->render[j] == '_')) j++;
+                                        
+                                        // Now, parse the rest of the line for numbers and strings
+                                        while (j < row->rsize) {
+                                            if (isspace(row->render[j])) {
+                                                j++;
+                                                continue;
+                                            }
+                    
+                                            // Check for strings
+                                            if (row->render[j] == '"') {
+                                                int string_start = j;
+                                                j++;
+                                                while (j < row->rsize && row->render[j] != '"') {
+                                                    if (row->render[j] == '\\' && j + 1 < row->rsize) j++;
+                                                    j++;
+                                                }
+                                                if (j < row->rsize) j++; // closing quote
+                                                memset(&row->hl[string_start], HL_DEFINE_STRING, j - string_start);
+                                                continue;
+                                            }
+                    
+                                            // Check for numbers
+                                            if (isdigit(row->render[j])) {
+                                                int number_start = j;
+                                                while (j < row->rsize && isdigit(row->render[j])) j++;
+                                                if (j < row->rsize && row->render[j] == '.') {
+                                                    j++;
+                                                    while (j < row->rsize && isdigit(row->render[j])) j++;
+                                                }
+                                                while (j < row->rsize && strchr("ulfULF", row->render[j])) j++;
+                                                memset(&row->hl[number_start], HL_DEFINE_NUMBER, j - number_start);
+                                                continue;
+                                            }
+                    
+                                            j++; // Move to next character if not space, string, or number
+                                        }
+                                    }                }
+                // This break is crucial for preprocessor directives to be handled fully and not re-parsed as other syntax
+                break;
+            }
+    
+        if (scs_len && !in_string && !in_comment) {
+            if (!strncmp(&row->render[i], scs, scs_len)) {
+                memset(&row->hl[i], HL_COMMENT, row->rsize - i);
+                break;
+            }
+        }
+        if (mcs_len && mce_len && !in_string) {
+            if (in_comment) {
+                row->hl[i] = HL_MLCOMMENT;
+                if (!strncmp(&row->render[i], mce, mce_len)) {
+                    memset(&row->hl[i], HL_MLCOMMENT, mce_len);
+                    i += mce_len;
+                    in_comment = 0;
+                    prev_sep = 1;
+                    continue;
+                } else {
+                    i++;
+                    continue;
+                }
+            } else if (!strncmp(&row->render[i], mcs, mcs_len)) {
+                memset(&row->hl[i], HL_MLCOMMENT, mcs_len);
+                i += mcs_len;
+                in_comment = 1;
+                prev_sep = 1;
+                continue;
+            }
+        }
+        if (E.syntax->flags & HL_HIGHLIGHT_STRINGS) {
+            if (in_string) {
+                row->hl[i] = HL_STRING;
+                if (c == '\\' && i + 1 < row->rsize) {
+                    row->hl[i + 1] = HL_STRING;
+                    i += 2;
+                    continue;
+                }
+                if (c == in_string) {
+                    in_string = 0;
+                    prev_sep = 1;
+                } else {
+                   prev_sep = 0;
+                }
+                i++;
+                continue;
+            } else {
+                if (prev_sep && (c == '"' || c == '\'')) {
+                    in_string = c;
+                    row->hl[i] = HL_STRING;
+                    i++;
+                    prev_sep = 0;
+                    continue;
+                }
+            }
+        }
+        if (E.syntax->flags & HL_HIGHLIGHT_NUMBERS) {
+            if ((isdigit(c) && (prev_sep || prev_hl == HL_NUMBER)) ||
+                (c == '.' && prev_hl == HL_NUMBER)) {
+                row->hl[i] = HL_NUMBER;
+                i++;
+                prev_sep = 0;
+                continue;
+            }
+        }
+        if (prev_sep) {
+            int j;
+            for (j = 0; keywords[j]; j++) {
+                int klen = strlen(keywords[j]);
+                int kw2 = keywords[j][klen - 1] == '|';
+                if (kw2) klen--;
+                if (!strncmp(&row->render[i], keywords[j], klen) &&
+                    is_separator(row->render[i + klen])) {
+                    memset(&row->hl[i], kw2 ? HL_KEYWORD2 : HL_KEYWORD1, klen);
+                    i += klen;
+                    goto next_word;
+                }
+            }
+        }
+    next_word:
+        prev_sep = is_separator(c);
+        i++;
+    }
+    int changed = (row->hl_open_comment != in_comment);
+    row->hl_open_comment = in_comment;
+    if (changed && row->idx + 1 < E.numrows)
+        editorUpdateSyntax(&E.row[row->idx + 1]);
+}
+void editorSelectSyntaxHighlight() {
+    E.syntax = NULL;
+    if (E.filename == NULL) return;
+    char *ext = strrchr(E.filename, '.');
+    for (unsigned int j = 0; j < HLDB_ENTRIES; j++) {
+        struct editorSyntax *s = &HLDB[j];
+        unsigned int i = 0;
+        while (s->filematch[i]) {
+            int is_ext = (s->filematch[i][0] == '.');
+            if ((is_ext && ext && strcmp(ext, s->filematch[i]) == 0) ||
+                (!is_ext && strstr(E.filename, s->filematch[i]))) {
+                E.syntax = s;
+                int filerow;
+                for (filerow = 0; filerow < E.numrows; filerow++) {
+                    editorUpdateSyntax(&E.row[filerow]);
+                }
+                return;
+            }
+            i++;
+        }
+    }
+}
+
 int editorSyntaxToColor(int hl) {
   switch (hl) {
+    case HL_PREPROC: return 35;
     case HL_COMMENT:
     case HL_MLCOMMENT: return 36;
-    case HL_KEYWORD1: return 33;
-    case HL_KEYWORD2: return 32;
-    case HL_STRING: return 35;
-    case HL_NUMBER: return 31;
+    case HL_KEYWORD1: return 34;
+    case HL_KEYWORD2: return 36;
+    case HL_STRING: return 33;
+    case HL_NUMBER: return 32;
     case HL_MATCH: return 34;
+    case HL_INCLUDE: return 32;
+    case HL_DEFINE_NUMBER: return 32;
+    case HL_DEFINE_STRING: return 33;
     default: return 37;
   }
 }
@@ -335,9 +619,7 @@ void editorUpdateRow(erow *row) {
   }
   row->render[idx] = '\0';
   row->rsize = idx;
-
-  row->hl = realloc(row->hl, row->rsize);
-  memset(row->hl, HL_NORMAL, row->rsize);
+  editorUpdateSyntax(row);
 }
 
 void editorInsertRow(int at, char *s, size_t len) {
@@ -570,6 +852,7 @@ void editorOpen(char *filename) {
   free(line);
   fclose(fp);
   E.dirty = 0;
+  editorSelectSyntaxHighlight();
 }
 
 void editorSave() {
@@ -579,6 +862,7 @@ void editorSave() {
       editorSetStatusMessage("キャンセルされました。");
       return;
     }
+    editorSelectSyntaxHighlight();
   }
   int len;
   char *buf = editorRowsToString(&len);
