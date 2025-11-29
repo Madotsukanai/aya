@@ -553,7 +553,12 @@ void editorOpen(char *filename) {
   free(E.filename);
   E.filename = strdup(filename);
   FILE *fp = fopen(filename, "r");
-  if (!fp) die("fopen");
+  if (!fp) {
+    if (errno != ENOENT) {
+      die("fopen");
+    }
+    return;
+  }
   char *line = NULL;
   size_t linecap = 0;
   ssize_t linelen;
