@@ -13,7 +13,7 @@ $(TARGET): $(TARGET).c
 
 # x86_64 build
 build-x86_64:
-	gcc $(CFLAGS_COMMON) $(TARGET).c -o $(TARGET)-x86_64
+	x86_64-linux-gnu-gcc $(CFLAGS_COMMON) $(TARGET).c -o $(TARGET)-x86_64
 
 # ARM64 build (requires aarch64 cross-compiler)
 build-arm64:
@@ -29,12 +29,12 @@ install: all
 # Install x86_64 version
 install-x86_64: build-x86_64
 	mkdir -p $(DESTDIR)$(PREFIX)/bin
-	cp $(TARGET)-x86_64 $(DESTDIR)$(PREFIX)/bin/$(TARGET)
+	cp $(TARGET) $(DESTDIR)$(PREFIX)/bin/$(TARGET)
 
 # Install ARM64 version
 install-arm64: build-arm64
 	mkdir -p $(DESTDIR)$(PREFIX)/bin
-	cp $(TARGET)-arm64 $(DESTDIR)$(PREFIX)/bin/$(TARGET)
+	cp $(TARGET) $(DESTDIR)$(PREFIX)/bin/$(TARGET)
 
 # --- Cleanup ---
 
