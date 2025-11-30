@@ -1507,9 +1507,9 @@ void editorDrawRows(struct abuf *ab) {
 
 
 void editorDrawStatusBar(struct abuf *ab) {
-    abAppend(ab, "\x1b[7m", 4); // 反転表示
-
     char status[80], rstatus[32];
+
+    // 左側ステータス
     int status_len = snprintf(status, sizeof(status), "%.20s - %d 行 %s",
                               E.filename ? E.filename : "[無題]",
                               E.numrows,
@@ -1517,30 +1517,36 @@ void editorDrawStatusBar(struct abuf *ab) {
     if (status_len < 0) status_len = 0;
     if (status_len > E.screencols) status_len = E.screencols;
 
+    // 右側ステータス
     int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d", E.cy + 1, E.numrows);
     if (rlen < 0) rlen = 0;
     if (rlen > E.screencols) rlen = E.screencols;
 
-    // 左側描画
-    int len = (status_len > E.screencols ? E.screencols : status_len);
-    abAppend(ab, status, len);
+    // 左側表示の切り詰め
+    int left_len = status_len;
+    if (left_len + rlen > E.screencols) left_len = E.screencols - rlen;
+    if (left_len < 0) left_len = 0;
 
-    // 左右の間を空白で埋める
-    int padding = E.screencols - len - rlen;
-    if (padding < 0) padding = 0;
-    for (int i = 0; i < padding; i++) abAppend(ab, " ", 1);
+    // 行頭クリア
+    abAppend(ab, "\r\x1b[K", 4);
 
-    // 右側描画
+    // 反転表示開始
+    abAppend(ab, "\x1b[7m", 4);
+
+    // 左側表示
+    abAppend(ab, status, left_len);
+
+    // 左右間を空白で埋める
+    for (int i = 0; i < E.screencols - left_len - rlen; i++)
+        abAppend(ab, " ", 1);
+
+    // 右側表示
     abAppend(ab, rstatus, rlen);
 
-    // 右端まで空白で残骸を完全に消す
-    int total_len = len + padding + rlen;
-    while (total_len < E.screencols) {
-        abAppend(ab, " ", 1);
-        total_len++;
-    }
+    // 反転解除
+    abAppend(ab, "\x1b[m", 3);
 
-    abAppend(ab, "\x1b[m", 3); // 反転解除
+    // 改行
     abAppend(ab, "\r\n", 2);
 }
 
