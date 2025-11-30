@@ -1552,14 +1552,23 @@ void editorDrawStatusBar(struct abuf *ab) {
 
 
 void editorDrawMessageBar(struct abuf *ab) {
-  abAppend(ab, "\x1b[K", 3);
-  int msglen = strlen(E.statusmsg);
-  if (msglen > E.screencols) msglen = E.screencols;
-  if (msglen && time(NULL) - E.statusmsg_time < 5) {
-    abAppend(ab, "\x1b[7m", 4);
-    abAppend(ab, E.statusmsg, msglen);
-  }
+    abAppend(ab, "\x1b[7m", 4);  // 反転（背景色）開始
+
+    int msglen = strlen(E.statusmsg);
+    if (msglen > E.screencols) msglen = E.screencols;
+
+    if (msglen > 0) {
+        abAppend(ab, E.statusmsg, msglen);
+    }
+
+    // 残りの幅をスペースで埋めて、前回の残骸を消す
+    for (int i = msglen; i < E.screencols; i++) {
+        abAppend(ab, " ", 1);
+    }
+
+    abAppend(ab, "\x1b[m", 3);  // 反転終了
 }
+
 
 void editorRefreshScreen() {
   editorScroll();
@@ -1724,6 +1733,17 @@ void editorRowInsertString(erow *row, int at, char *s, size_t len) {
   E.dirty++;
 }
 
+/*** ヘルプ表示 ***/
+void showHelpMessage() {
+    editorSetStatusMessage(
+        "ヘルプ: Ctrl+S=保存 | Ctrl+Q=終了 | Ctrl+F=検索"
+    );
+    editorRefreshScreen();
+    editorReadKey();
+    editorSetStatusMessage("");
+    editorRefreshScreen();
+}
+
 void editorProcessKeypress() {
   static int quit_times = AYA_QUIT_TIMES;
   int c = editorReadKey();
@@ -1733,8 +1753,7 @@ void editorProcessKeypress() {
       break;
     case CTRL_KEY('q'):
       if (E.dirty && quit_times > 0) {
-        editorSetStatusMessage("!!!変更は保存されていません!!!"
-          "ctrl+Q をあと %d 回押すと終了", quit_times);
+        editorSetStatusMessage("!!!変更は保存されていません!!!あと%d回", quit_times);
         quit_times--;
         return;
       }
@@ -1744,6 +1763,9 @@ void editorProcessKeypress() {
       break;
     case CTRL_KEY('s'):
       editorSave();
+      break;
+    case CTRL_KEY('h'):
+      showHelpMessage();
       break;
     case CTRL_KEY('y'):
       editorRedo();
@@ -1763,7 +1785,6 @@ void editorProcessKeypress() {
       editorFind();
       break;
     case BACKSPACE:
-    case CTRL_KEY('h'):
     case DEL_KEY:
       if (E.selection_start_cy != -1) {
         editorDeleteSelection();
@@ -1946,7 +1967,7 @@ int main(int argc, char *argv[]) {
   if (argc >= 2) {
     editorOpen(argv[1]);
   }
-  editorSetStatusMessage("ヘルプ: ctrl+S = 保存 | ctrl+Q = 終了 | ctrl+F = 検索");
+  showHelpMessage();
   while (1) {
     editorRefreshScreen();
     editorProcessKeypress();
