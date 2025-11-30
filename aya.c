@@ -15,10 +15,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#define NUMROWS_CHANGES 1
-#if NUMROWS_CHANGES
-#include <stdio.h>
-#endif
 
 #define AYA_VERSION "0.0.4"
 #define AYA_TAB_STOP 8
@@ -996,9 +992,6 @@ void editorDelRow(int at) {
   memmove(&E.row[at], &E.row[at + 1], sizeof(erow) * (E.numrows - at - 1));
   for (int j = at; j < E.numrows - 1; j++) E.row[j].idx--;
   E.numrows--;
-#if NUMROWS_CHANGES
-  fprintf(stderr, "DEBUG: editorDelRow - AFTER E.numrows: %d\n", E.numrows);
-#endif
 
   E.dirty++;
 }
@@ -1514,26 +1507,43 @@ void editorDrawRows(struct abuf *ab) {
 
 
 void editorDrawStatusBar(struct abuf *ab) {
-  abAppend(ab, "\x1b[7m", 4);
-  char status[80], rstatus[80];
-  int len = snprintf(status, sizeof(status), "%.20s - %d 行 %s",
-    E.filename ? E.filename : "[無題]", E.numrows,
-    E.dirty ? "(変更済)" : "");
-  int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d",
-    E.cy + 1, E.numrows);
-  if (len > E.screencols) len = E.screencols;
-  abAppend(ab, status, len);
-  while (len < E.screencols) {
-    if (E.screencols - len == rlen) {
-      abAppend(ab, rstatus, rlen);
-      break;
+    abAppend(ab, "\x1b[7m", 4); // 反転表示
+
+    char status[80], rstatus[32];
+    int status_len = snprintf(status, sizeof(status), "%.20s - %d 行 %s",
+                              E.filename ? E.filename : "[無題]",
+                              E.numrows,
+                              E.dirty ? "(変更済)" : "");
+    if (status_len < 0) status_len = 0;
+    if (status_len > E.screencols) status_len = E.screencols;
+
+    int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d", E.cy + 1, E.numrows);
+    if (rlen < 0) rlen = 0;
+    if (rlen > E.screencols) rlen = E.screencols;
+
+    // 左側描画
+    int len = (status_len > E.screencols ? E.screencols : status_len);
+    abAppend(ab, status, len);
+
+    // 左右の間を空白で埋める
+    int padding = E.screencols - len - rlen;
+    if (padding < 0) padding = 0;
+    for (int i = 0; i < padding; i++) abAppend(ab, " ", 1);
+
+    // 右側描画
+    abAppend(ab, rstatus, rlen);
+
+    // 右端まで空白で残骸を完全に消す
+    int total_len = len + padding + rlen;
+    while (total_len < E.screencols) {
+        abAppend(ab, " ", 1);
+        total_len++;
     }
-    abAppend(ab, " ", 1);
-    len++;
-  }
-  abAppend(ab, "\x1b[m", 3);
-  abAppend(ab, "\r\n", 2);
+
+    abAppend(ab, "\x1b[m", 3); // 反転解除
+    abAppend(ab, "\r\n", 2);
 }
+
 
 void editorDrawMessageBar(struct abuf *ab) {
   abAppend(ab, "\x1b[K", 3);
