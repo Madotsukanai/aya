@@ -15,7 +15,12 @@
 #include <time.h>
 #include <unistd.h>
 
-#define AYA_VERSION "0.0.1"
+#define NUMROWS_CHANGES 1
+#if NUMROWS_CHANGES
+#include <stdio.h>
+#endif
+
+#define AYA_VERSION "0.0.4"
 #define AYA_TAB_STOP 8
 #define AYA_QUIT_TIMES 3
 
@@ -136,6 +141,27 @@ struct editorSyntax HLDB[] = {
 
 #define HLDB_ENTRIES (sizeof(HLDB) / sizeof(HLDB[0]))
 
+/*** undo/redo ***/
+enum undoActionType {
+  ACTION_INSERT_CHAR,
+  ACTION_DELETE_CHAR,
+  ACTION_SPLIT_LINE,
+  ACTION_JOIN_LINES,
+  ACTION_INSERT_STRING,
+  ACTION_DELETE_STRING
+};
+typedef struct {
+  enum undoActionType type;
+  int cx, cy;
+  union {
+    char ch;
+    struct {
+      char *str;
+      int len;
+    } string;
+  } data;
+} undoAction;
+
 /*** data ***/
 
 typedef struct erow {
@@ -167,6 +193,13 @@ struct editorConfig {
   int selection_start_cy;
   int selection_end_cx;
   int selection_end_cy;
+  undoAction *undo_stack;
+  int undo_count;
+  int undo_capacity;
+  undoAction *redo_stack;
+  int redo_count;
+  int redo_capacity;
+  int is_undo_redo;
 };
 
 struct editorConfig E;
@@ -177,6 +210,9 @@ void editorSetStatusMessage(const char *fmt, ...);
 void editorRefreshScreen();
 char *editorPrompt(char *prompt, void (*callback)(char *, int));
 void editorMoveCursor(int key);
+void editorInsertString(char *s, int len);
+void editorUndo();
+void editorRedo();
 int editorRowRxToCx(erow *row, int rx);
 void editorClearSelection();
 int is_selected(int filerow, int cx);
@@ -184,13 +220,30 @@ char *editorGetSelectedString();
 void editorDeleteSelection();
 void editorUpdateSyntax(erow *row);
 void editorSelectSyntaxHighlight();
+void editorRowInsertString(erow *row, int at, char *s, size_t len);
+void editorInsertNewLine();
+void editorRowDelChar(erow *row, int at);
+void editorRowInsertChar(erow *row, int at, int c);
+void editorRowAppendString(erow *row, char *s, size_t len);
+void editorDelRow(int at);
+void editorInsertRow(int at, char *s, size_t len);
+void editorUpdateRow(erow *row);
+void editorDelChar();
+// undo 系関数のプロトタイプ
+void push_action(undoAction **stack, int *count, int *capacity, undoAction action);
+void push_undo_action(undoAction action);
+
+// editorDeleteSelection
+char *editorGetSelectedString();
+void editorDeleteSelection();
 
 /*** terminal ***/
 
 void die(const char *s) {
   write(STDOUT_FILENO, "\x1b[2J", 4);
   write(STDOUT_FILENO, "\x1b[H", 3);
-  perror(s);
+
+  fprintf(stderr, "%s: %s\n", s, strerror(errno));
   exit(1);
 }
 
@@ -334,8 +387,26 @@ int getWindowSize(int *rows, int *cols) {
 int is_separator(int c) {
   return isspace(c) || c == '\0' || strchr(",.()+-/*=~%<>[];", c) != NULL;
 }
+
+int utf8_char_len_from_byte(unsigned char byte) {
+    if (byte < 0x80) return 1;
+    if ((byte & 0xE0) == 0xC0) return 2;
+    if ((byte & 0xF0) == 0xE0) return 3;
+    if ((byte & 0xF8) == 0xF0) return 4;
+    return 1; // Not a valid start byte, treat as single byte
+}
+
 void editorUpdateSyntax(erow *row) {
+    if (row->rsize == 0) {
+        free(row->hl);
+        row->hl = NULL;
+        return;
+    }
     row->hl = realloc(row->hl, row->rsize);
+    if (row->hl == NULL) {
+    
+        die("realloc failed in editorUpdateSyntax");
+    }
     memset(row->hl, HL_NORMAL, row->rsize);
     if (E.syntax == NULL) return;
     char **keywords = E.syntax->keywords;
@@ -551,7 +622,7 @@ int editorSyntaxToColor(int hl) {
     case HL_INCLUDE: return 32;
     case HL_DEFINE_NUMBER: return 32;
     case HL_DEFINE_STRING: return 33;
-    default: return 37;
+    default: return 39;
   }
 }
 
@@ -565,16 +636,271 @@ struct abuf {
 #define ABUF_INIT {NULL, 0}
 
 void abAppend(struct abuf *ab, const char *s, int len) {
-  char *new = realloc(ab->b, ab->len + len);
-  if (new == NULL) return;
-  memcpy(&new[ab->len], s, len);
-  ab->b = new;
-  ab->len += len;
+    char *new = realloc(ab->b, ab->len + len + 1); // +1 for null terminator
+    if (new == NULL) die("realloc failed in abAppend");
+    memcpy(new + ab->len, s, len);
+    new[ab->len + len] = '\0';
+
+    ab->b = new;
+    ab->len += len;
 }
+
+
 
 void abFree(struct abuf *ab) {
   free(ab->b);
 }
+
+/*** undo/redo helpers ***/
+
+// プロトタイプ宣言
+void push_action(undoAction **stack, int *count, int *capacity, undoAction action);
+void clear_undo_stack(undoAction **stack, int *count, int *capacity);
+
+// push_action の定義
+void push_action(undoAction **stack, int *count, int *capacity, undoAction action) {
+    if (*capacity == *count) {
+        *capacity = *capacity < 8 ? 8 : *capacity * 2;
+        undoAction *new_stack = realloc(*stack, sizeof(undoAction) * (*capacity));
+        if (!new_stack) die("realloc failed in push_action");
+        *stack = new_stack;
+    }
+
+    if (action.type == ACTION_DELETE_STRING || action.type == ACTION_INSERT_STRING ||
+        action.type == ACTION_JOIN_LINES || action.type == ACTION_SPLIT_LINE) {
+        if (action.data.string.str != NULL) {
+            char *new_str = strdup(action.data.string.str);
+            if (!new_str) die("strdup failed in push_action");
+            action.data.string.str = new_str;
+        } else {
+            action.data.string.str = NULL;
+        }
+    }
+
+    (*stack)[*count] = action;
+    (*count)++;
+}
+
+// push_undo_action の定義
+void push_undo_action(undoAction action) {
+    if (E.is_undo_redo) return;
+    push_action(&E.undo_stack, &E.undo_count, &E.undo_capacity, action);
+    clear_undo_stack(&E.redo_stack, &E.redo_count, &E.redo_capacity);
+}
+
+// clear_undo_stack の定義
+void clear_undo_stack(undoAction **stack, int *count, int *capacity) {
+    if (*stack == NULL) return;
+    for (int i = 0; i < *count; i++) {
+        if ((*stack)[i].type == ACTION_DELETE_STRING || (*stack)[i].type == ACTION_INSERT_STRING ||
+            (*stack)[i].type == ACTION_JOIN_LINES || (*stack)[i].type == ACTION_SPLIT_LINE) {
+            if ((*stack)[i].data.string.str) free((*stack)[i].data.string.str);
+        }
+    }
+    free(*stack);
+    *stack = NULL;
+    *count = 0;
+    *capacity = 0;
+}
+
+
+
+void editorRedo();
+
+void editorInsertString(char *s, int len) {
+    if (E.selection_start_cy != -1) {
+        editorDeleteSelection();
+    }
+
+    char *line_start = s;
+    for (int i = 0; i <= len; i++) {
+        if (i == len || s[i] == '\n' || s[i] == '\r') {
+            if (i > 0 && s[i-1] == '\r' && s[i] == '\n') {
+                line_start = (char *)&s[i+1];
+                continue;
+            }
+            int line_len = &s[i] - line_start;
+            if (line_len > 0) {
+              editorRowInsertString(&E.row[E.cy], E.cx, line_start, line_len);
+              E.cx += line_len;
+            }
+            if (i < len && (s[i] == '\n' || s[i] == '\r')) {
+                editorInsertNewLine();
+
+            }
+            line_start = (char *)&s[i+1];
+        }
+    }
+
+}
+
+
+void editorUndo() {
+  if (E.undo_count == 0) {
+    editorSetStatusMessage("元に戻すことはできません");
+    return;
+  }
+  E.is_undo_redo = 1;
+
+  E.undo_count--;
+  undoAction action = E.undo_stack[E.undo_count];
+
+
+  
+  // Move the action to the redo stack. Note that we don't free its data.
+  push_action(&E.redo_stack, &E.redo_count, &E.redo_capacity, action);
+  if (action.type == ACTION_DELETE_STRING || action.type == ACTION_INSERT_STRING ||
+      action.type == ACTION_JOIN_LINES || action.type == ACTION_SPLIT_LINE) {
+    E.undo_stack[E.undo_count].data.string.str = NULL; // Transfer ownership
+  }
+
+  E.cx = action.cx;
+  E.cy = action.cy;
+
+  // Perform the INVERSE of the action
+  switch (action.type) {
+    case ACTION_INSERT_CHAR:
+      editorRowDelChar(&E.row[action.cy], action.cx);
+      break;
+    case ACTION_DELETE_CHAR:
+      editorRowInsertChar(&E.row[action.cy], action.cx, action.data.ch);
+      E.cx++;
+      break;
+    case ACTION_SPLIT_LINE: // Undo a split is to join
+      editorRowAppendString(&E.row[action.cy], E.row[action.cy + 1].chars, E.row[action.cy + 1].size);
+      editorDelRow(action.cy + 1);
+      break;
+    case ACTION_JOIN_LINES: { // Undo a join is to split
+      erow *row = &E.row[action.cy];
+      editorInsertRow(action.cy + 1, action.data.string.str, action.data.string.len);
+      // Truncate the line that was appended to.
+      row->size = action.cx;
+      row->chars[row->size] = '\0';
+      editorUpdateRow(row);
+      E.cy++; E.cx = 0;
+      break;
+    }
+    case ACTION_INSERT_STRING: {
+       int end_y = action.cy;
+      int end_x = action.cx;
+      for (int i = 0; i < action.data.string.len; i++) {
+        if (action.data.string.str[i] == '\n') {
+          end_y++;
+          end_x = 0;
+        } else {
+          end_x++;
+        }
+      }
+      if (action.cy == end_y) { // Single line
+          erow *row = &E.row[action.cy];
+          memmove(&row->chars[action.cx], &row->chars[end_x], row->size - end_x + 1);
+          row->size -= (end_x - action.cx);
+          editorUpdateRow(row);
+      } else { // Multi-line
+          erow *start_row = &E.row[action.cy];
+          erow *end_row = &E.row[end_y];
+          if (end_x > end_row->size) end_x = end_row->size; // Bound end_x
+          char *content_after = strdup(&end_row->chars[end_x]);
+          start_row->size = action.cx;
+          editorRowAppendString(start_row, content_after, strlen(content_after));
+          free(content_after);
+          for (int i = action.cy + 1; i <= end_y; i++) {
+              editorDelRow(action.cy + 1);
+          }
+      }
+      break;
+    }
+    case ACTION_DELETE_STRING:
+      editorInsertString(action.data.string.str, action.data.string.len);
+      break;
+  }
+  E.is_undo_redo = 0;
+  E.dirty++;
+
+}
+
+void editorRedo() {
+  if (E.redo_count == 0) {
+    editorSetStatusMessage("やり直すことはできません");
+    return;
+  }
+  E.is_undo_redo = 1;
+  
+  E.redo_count--;
+  undoAction action = E.redo_stack[E.redo_count];
+  
+  // Move action back to undo stack.
+  push_action(&E.undo_stack, &E.undo_count, &E.undo_capacity, action);
+  if (action.type == ACTION_DELETE_STRING || action.type == ACTION_INSERT_STRING ||
+      action.type == ACTION_JOIN_LINES || action.type == ACTION_SPLIT_LINE) {
+    E.redo_stack[E.redo_count].data.string.str = NULL; // Transfer ownership
+  }
+
+  E.cx = action.cx;
+  E.cy = action.cy;
+
+  // Perform the ORIGINAL action
+  switch(action.type) {
+    case ACTION_INSERT_CHAR:
+      editorRowInsertChar(&E.row[action.cy], action.cx, action.data.ch);
+      E.cx++;
+      break;
+    case ACTION_DELETE_CHAR:
+      editorRowDelChar(&E.row[action.cy], action.cx);
+      break;
+    case ACTION_SPLIT_LINE: {
+      erow *row = &E.row[action.cy];
+      editorInsertRow(action.cy + 1, action.data.string.str, action.data.string.len);
+      row->size = action.cx;
+      row->chars[row->size] = '\0';
+      editorUpdateRow(row);
+      E.cy++; E.cx = 0;
+      break;
+    }
+    case ACTION_JOIN_LINES: {
+      editorRowAppendString(&E.row[action.cy], E.row[action.cy + 1].chars, E.row[action.cy + 1].size);
+      editorDelRow(action.cy + 1);
+      break;
+    }
+    case ACTION_INSERT_STRING:
+      editorInsertString(action.data.string.str, action.data.string.len);
+      break;
+    case ACTION_DELETE_STRING: {
+      int end_y = action.cy;
+      int end_x = action.cx;
+      for (int i = 0; i < action.data.string.len; i++) {
+        if (action.data.string.str[i] == '\n') {
+          end_y++;
+          end_x = 0;
+        } else {
+          end_x++;
+        }
+      }
+      if (action.cy == end_y) {
+          erow *row = &E.row[action.cy];
+          memmove(&row->chars[action.cx], &row->chars[end_x], row->size - end_x + 1);
+          row->size -= (end_x - action.cx);
+          editorUpdateRow(row);
+      } else {
+          erow *start_row = &E.row[action.cy];
+          erow *end_row = &E.row[end_y];
+          if (end_x > end_row->size) end_x = end_row->size; // Bound end_x
+          char *content_after = strdup(&end_row->chars[end_x]);
+          start_row->size = action.cx;
+          editorRowAppendString(start_row, content_after, strlen(content_after));
+          free(content_after);
+          for (int i = action.cy + 1; i <= end_y; i++) {
+              editorDelRow(action.cy + 1);
+          }
+      }
+      break;
+    }
+  }
+  
+  E.is_undo_redo = 0;
+  E.dirty++;
+}
+
 
 /*** row operations ***/
 
@@ -608,6 +934,10 @@ void editorUpdateRow(erow *row) {
     if (row->chars[j] == '\t') tabs++;
   free(row->render);
   row->render = malloc(row->size + tabs * (AYA_TAB_STOP - 1) + 1);
+  if (row->render == NULL) {
+
+      die("malloc failed in editorUpdateRow");
+  }
   int idx = 0;
   for (j = 0; j < row->size; j++) {
     if (row->chars[j] == '\t') {
@@ -624,10 +954,16 @@ void editorUpdateRow(erow *row) {
 
 void editorInsertRow(int at, char *s, size_t len) {
   if (at < 0 || at > E.numrows) return;
+
   E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
+  if (E.row == NULL) {
+
+      die("realloc failed in editorInsertRow");
+  }
   if (at < E.numrows) {
     memmove(&E.row[at + 1], &E.row[at], sizeof(erow) * (E.numrows - at));
   }
+  for (int j = at + 1; j <= E.numrows; j++) E.row[j].idx++;
   E.row[at].idx = at;
   E.row[at].size = len;
   E.row[at].chars = malloc(len + 1);
@@ -639,19 +975,31 @@ void editorInsertRow(int at, char *s, size_t len) {
   E.row[at].hl_open_comment = 0;
   editorUpdateRow(&E.row[at]);
   E.numrows++;
+
+
   E.dirty++;
 }
 
 void editorFreeRow(erow *row) {
   free(row->render);
+  row->render = NULL;
   free(row->chars);
+  row->chars = NULL;
+  free(row->hl);
+  row->hl = NULL;
 }
 
 void editorDelRow(int at) {
   if (at < 0 || at >= E.numrows) return;
+
   editorFreeRow(&E.row[at]);
   memmove(&E.row[at], &E.row[at + 1], sizeof(erow) * (E.numrows - at - 1));
+  for (int j = at; j < E.numrows - 1; j++) E.row[j].idx--;
   E.numrows--;
+#if NUMROWS_CHANGES
+  fprintf(stderr, "DEBUG: editorDelRow - AFTER E.numrows: %d\n", E.numrows);
+#endif
+
   E.dirty++;
 }
 
@@ -687,22 +1035,42 @@ char *editorGetSelectedString() {
 
   struct abuf ab = ABUF_INIT;
 
-  for (int y = E.selection_start_cy; y <= E.selection_end_cy; y++) {
-    erow *row = &E.row[y];
-    int start_x = (y == E.selection_start_cy) ? E.selection_start_cx : 0;
-    int end_x = (y == E.selection_end_cy) ? E.selection_end_cx : row->size;
+  int start_y = E.selection_start_cy;
+  int start_x = E.selection_start_cx;
+  int end_y = E.selection_end_cy;
+  int end_x = E.selection_end_cx;
 
-    abAppend(&ab, &row->chars[start_x], end_x - start_x);
-    if (y < E.selection_end_cy) {
+  if (start_y > end_y || (start_y == end_y && start_x > end_x)) {
+      int tmp_y = start_y; start_y = end_y; end_y = tmp_y;
+      int tmp_x = start_x; start_x = end_x; end_x = tmp_x;
+  }
+
+  for (int y = start_y; y <= end_y; y++) {
+    if (y >= E.numrows) break;
+    erow *row = &E.row[y];
+    int line_start_x = (y == start_y) ? start_x : 0;
+    int line_end_x = (y == end_y) ? end_x : row->size;
+
+    if (line_start_x > row->size) line_start_x = row->size;
+    if (line_end_x > row->size) line_end_x = row->size;
+
+    if (line_end_x > line_start_x) {
+      abAppend(&ab, &row->chars[line_start_x], line_end_x - line_start_x);
+    }
+    if (y < end_y) {
       abAppend(&ab, "\n", 1);
     }
   }
 
-  return ab.b;
+  // ここで strdup して返す
+  char *ret = strdup(ab.b ? ab.b : "");
+  abFree(&ab); // ab の内部バッファを解放
+  return ret;
 }
 
 void editorDeleteSelection() {
     if (E.selection_start_cy == -1) return;
+
     int start_y = E.selection_start_cy;
     int start_x = E.selection_start_cx;
     int end_y = E.selection_end_cy;
@@ -712,6 +1080,22 @@ void editorDeleteSelection() {
         // Swap them
         int tmp_y = start_y; start_y = end_y; end_y = tmp_y;
         int tmp_x = start_x; start_x = end_x; end_x = tmp_x;
+    }
+
+    if (!E.is_undo_redo) {
+      char *selected = editorGetSelectedString();
+      if (selected) {
+        undoAction action;
+        action.type = ACTION_DELETE_STRING;
+        action.cx = start_x;
+        action.cy = start_y;
+        action.data.string.str = strdup(selected); // 既存 push_undo_action と同等
+        action.data.string.len = strlen(selected);
+        push_undo_action(action);
+
+        free(selected); // ← 追加: editorGetSelectedString の戻り値は free 必須
+        selected = NULL;
+      }
     }
 
     E.cy = start_y;
@@ -737,8 +1121,8 @@ void editorDeleteSelection() {
             editorDelRow(start_y + 1);
         }
     }
-    E.dirty++;
     editorClearSelection();
+
 }
 
 
@@ -772,7 +1156,18 @@ void editorClearSelection() {
 /*** editor operations ***/
 
 void editorInsertChar(int c) {
-  editorClearSelection();
+  if (E.selection_start_cy != -1) {
+    editorDeleteSelection();
+  }
+  if (!E.is_undo_redo) {
+    undoAction action;
+    action.type = ACTION_INSERT_CHAR;
+    action.cx = E.cx;
+    action.cy = E.cy;
+    action.data.ch = c;
+    push_undo_action(action);
+  }
+
   if (E.cy == E.numrows) {
     editorInsertRow(E.numrows, "", 0);
   }
@@ -781,29 +1176,80 @@ void editorInsertChar(int c) {
 }
 
 void editorInsertNewLine() {
-  if (E.cx == 0) {
-    editorInsertRow(E.cy, "", 0);
-  } else {
-    erow *row = &E.row[E.cy];
-    editorInsertRow(E.cy + 1, &row->chars[E.cx], row->size - E.cx);
-    row = &E.row[E.cy];
-    row->size = E.cx;
-    row->chars[row->size] = '\0';
-    editorUpdateRow(row);
-  }
-  E.cy++;
-  E.cx = 0;
+    if (E.selection_start_cy != -1) {
+        editorDeleteSelection();
+    }
+
+    // Undo 用の情報
+    if (!E.is_undo_redo) {
+        undoAction action;
+        action.type = ACTION_SPLIT_LINE;
+        action.cx = E.cx;
+        action.cy = E.cy;
+
+        if (E.cy < E.numrows) {
+            erow *row = &E.row[E.cy];
+            if (E.cx <= row->size) {
+                action.data.string.str = strdup(&row->chars[E.cx]);
+                action.data.string.len = row->size - E.cx;
+            } else {
+                action.data.string.str = strdup("");
+                action.data.string.len = 0;
+            }
+        } else {
+            action.data.string.str = strdup("");
+            action.data.string.len = 0;
+        }
+
+        push_undo_action(action);
+        free(action.data.string.str);
+    }
+
+    // 新しい行の挿入
+    if (E.cy == E.numrows) {
+        editorInsertRow(E.numrows, "", 0); // ファイル末尾に行を追加
+    } else if (E.cx == 0) {
+        editorInsertRow(E.cy, "", 0);
+    } else {
+        erow *row = &E.row[E.cy];
+        editorInsertRow(E.cy + 1, &row->chars[E.cx], row->size - E.cx);
+        row = &E.row[E.cy];
+        row->size = E.cx;
+        row->chars[row->size] = '\0';
+        editorUpdateRow(row);
+    }
+
+    E.cy++;
+    E.cx = 0;
 }
 
 void editorDelChar() {
-  editorClearSelection();
   if (E.cy == E.numrows) return;
   if (E.cx == 0 && E.cy == 0) return;
+
   erow *row = &E.row[E.cy];
   if (E.cx > 0) {
+    if (!E.is_undo_redo) {
+      undoAction action;
+      action.type = ACTION_DELETE_CHAR;
+      action.cx = E.cx - 1;
+      action.cy = E.cy;
+      action.data.ch = row->chars[E.cx - 1];
+      push_undo_action(action);
+    }
     editorRowDelChar(row, E.cx - 1);
     E.cx--;
   } else {
+    if (!E.is_undo_redo) {
+      undoAction action;
+      action.type = ACTION_JOIN_LINES;
+      action.cx = E.row[E.cy - 1].size;
+      action.cy = E.cy - 1;
+      action.data.string.str = strdup(row->chars);
+      action.data.string.len = row->size;
+      push_undo_action(action);
+      free(action.data.string.str);
+    }
     E.cx = E.row[E.cy - 1].size;
     editorRowAppendString(&E.row[E.cy - 1], row->chars, row->size);
     editorDelRow(E.cy);
@@ -980,139 +1426,89 @@ void editorScroll() {
 }
 
 void editorDrawRows(struct abuf *ab) {
-
   int y;
-
   for (y = 0; y < E.screenrows; y++) {
-
     int filerow = y + E.rowoff;
-
     if (filerow >= E.numrows) {
-
       if (E.numrows == 0 && y == E.screenrows / 3) {
-
         char welcome[80];
-
         int welcomelen = snprintf(welcome, sizeof(welcome),
-
           "Aya Editor -- version %s", AYA_VERSION);
-
         if (welcomelen > E.screencols) welcomelen = E.screencols;
-
         int padding = (E.screencols - welcomelen) / 2;
-
         if (padding) {
-
           abAppend(ab, "~", 1);
-
           padding--;
-
         }
-
         while (padding--) abAppend(ab, " ", 1);
-
         abAppend(ab, welcome, welcomelen);
-
       } else {
-
         abAppend(ab, "~", 1);
-
       }
-
     } else {
-
       int len = E.row[filerow].rsize - E.coloff;
-
       if (len < 0) len = 0;
-
       if (len > E.screencols) len = E.screencols;
-
       char *c = &E.row[filerow].render[E.coloff];
-
       unsigned char *hl = &E.row[filerow].hl[E.coloff];
+      
+      int current_color_applied = 39; // Start with default foreground color
+      int current_invert_applied = 0; // 0 for no invert, 1 for invert
+      
+      int j = 0;
+      while (j < len) {
+        int char_len = utf8_char_len_from_byte(c[j]);
+        if (j + char_len > len) char_len = 1;
 
-      int current_color = -1;
+        int is_sel_for_this_char = is_selected(filerow, editorRowRxToCx(&E.row[filerow], E.coloff + j));
+        int color_for_this_char = editorSyntaxToColor(hl[j]);
 
-      int j;
-
-      for (j = 0; j < len; j++) {
-
-        if (is_selected(filerow, editorRowRxToCx(&E.row[filerow], E.coloff + j))) {
-
-          abAppend(ab, "\x1b[7m", 4);
-
+        // Manage inversion (selection)
+        if (is_sel_for_this_char && !current_invert_applied) {
+          abAppend(ab, "\x1b[7m", 4); // Turn on inversion
+          current_invert_applied = 1;
+        } else if (!is_sel_for_this_char && current_invert_applied) {
+          abAppend(ab, "\x1b[27m", 5); // Turn off inversion
+          current_invert_applied = 0;
         }
 
+        // Manage color
+        if (color_for_this_char != current_color_applied) {
+          current_color_applied = color_for_this_char;
+          char buf[16];
+          int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", current_color_applied);
+          abAppend(ab, buf, clen);
+        }
+
+        // Handle control characters (they override styling for their symbol)
         if (iscntrl(c[j])) {
-
           char sym = (c[j] <= 26) ? '@' + c[j] : '?';
-
-          abAppend(ab, "\x1b[7m", 4);
-
+          // Reset all attributes, then apply reverse video for the symbol
+          abAppend(ab, "\x1b[m", 3); 
+          abAppend(ab, "\x1b[7m", 4); 
           abAppend(ab, &sym, 1);
-
-          abAppend(ab, "\x1b[m", 3);
-
-          if (current_color != -1) {
-
-            char buf[16];
-
-            int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", current_color);
-
-            abAppend(ab, buf, clen);
-
-          }
-
-        } else if (hl[j] == HL_NORMAL) {
-
-          if (current_color != -1) {
-
-            abAppend(ab, "\x1b[39m", 5);
-
-            current_color = -1;
-
-          }
-
-          abAppend(ab, &c[j], 1);
-
+          abAppend(ab, "\x1b[m", 3); // Reset after symbol
+          
+          // Force re-evaluation of color and invert state for next character
+          current_color_applied = 39; 
+          current_invert_applied = 0; 
         } else {
-
-          int color = editorSyntaxToColor(hl[j]);
-
-          if (color != current_color) {
-
-            current_color = color;
-
-            char buf[16];
-
-            int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", color);
-
-            abAppend(ab, buf, clen);
-
-          }
-
-          abAppend(ab, &c[j], 1);
-
+          // Normal character: just append it
+          abAppend(ab, &c[j], char_len);
         }
-
-        if (is_selected(filerow, editorRowRxToCx(&E.row[filerow], E.coloff + j))) {
-
-          abAppend(ab, "\x1b[m", 3);
-
-        }
-
+        j += char_len;
       }
-
-      abAppend(ab, "\x1b[39m", 5);
-
+      // After the loop, ensure everything is reset to default
+      if (current_invert_applied) {
+        abAppend(ab, "\x1b[27m", 5); // Turn off inversion
+      }
+      if (current_color_applied != 39) {
+        abAppend(ab, "\x1b[39m", 5); // Reset to default foreground color
+      }
     }
-
     abAppend(ab, "\x1b[K", 3);
-
     abAppend(ab, "\r\n", 2);
-
   }
-
 }
 
 
@@ -1333,6 +1729,13 @@ void editorProcessKeypress() {
     case CTRL_KEY('s'):
       editorSave();
       break;
+    case CTRL_KEY('y'):
+      editorRedo();
+      break;
+    case CTRL_KEY('z'):
+    case '\0':
+      editorUndo();
+      break;
     case HOME_KEY:
       E.cx = 0;
       break;
@@ -1346,8 +1749,12 @@ void editorProcessKeypress() {
     case BACKSPACE:
     case CTRL_KEY('h'):
     case DEL_KEY:
-      if (c == DEL_KEY) editorMoveCursor(ARROW_RIGHT);
-      editorDelChar();
+      if (E.selection_start_cy != -1) {
+        editorDeleteSelection();
+      } else {
+        if (c == DEL_KEY) editorMoveCursor(ARROW_RIGHT);
+        editorDelChar();
+      }
       break;
     case PAGE_UP:
     case PAGE_DOWN:
@@ -1430,35 +1837,25 @@ void editorProcessKeypress() {
           pclose(p);
 
           if (text) {
+            if (!E.is_undo_redo) {
+              undoAction action;
+              action.type = ACTION_INSERT_STRING;
+              action.cx = E.cx;
+              action.cy = E.cy;
+              action.data.string.str = text;
+              action.data.string.len = len;
+              push_undo_action(action);
+            text = NULL;
+            }
+
             size_t sanitized_len = 0;
             for (size_t i = 0; i < len; i++) {
               if (isprint(text[i]) || text[i] == '\t' || text[i] == '\n' || text[i] == '\r') {
                 text[sanitized_len++] = text[i];
               }
             }
-            len = sanitized_len;
             text[len] = '\0';
-
-            if (E.cy == E.numrows && len > 0) {
-              editorInsertRow(E.numrows, "", 0);
-            }
-            char *line_start = text;
-            for (size_t i = 0; i < len; i++) {
-              if (text[i] == '\n' || text[i] == '\r') {
-                if (i > 0 && text[i-1] == '\r' && text[i] == '\n') {
-                  line_start = (char *)&text[i+1];
-                  continue;
-                }
-                text[i] = '\0';
-                editorRowInsertString(&E.row[E.cy], E.cx, line_start, strlen(line_start));
-                E.cx += strlen(line_start);
-                editorInsertNewLine();
-                line_start = (char *)&text[i+1];
-              }
-            }
-            editorRowInsertString(&E.row[E.cy], E.cx, line_start, strlen(line_start));
-            E.cx += strlen(line_start);
-
+            editorInsertString(text, len);
             free(text);
             editorSetStatusMessage("クリップボードから貼り付けました");
           }
@@ -1494,6 +1891,13 @@ void initEditor() {
   E.selection_start_cy = -1;
   E.selection_end_cx = -1;
   E.selection_end_cy = -1;
+  E.undo_stack = NULL;
+  E.undo_count = 0;
+  E.undo_capacity = 0;
+  E.redo_stack = NULL;
+  E.redo_count = 0;
+  E.redo_capacity = 0;
+  E.is_undo_redo = 0;
   if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
   E.screenrows -= 2;
 }
