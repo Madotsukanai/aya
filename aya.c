@@ -5,6 +5,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <locale.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -14,6 +15,7 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include <wchar.h>
 
 
 #define AYA_VERSION "0.0.4"
@@ -214,11 +216,12 @@ void editorClearSelection();
 int is_selected(int filerow, int cx);
 char *editorGetSelectedString();
 void editorDeleteSelection();
+int utf8_char_len_from_byte(unsigned char byte);
 void editorUpdateSyntax(erow *row);
 void editorSelectSyntaxHighlight();
 void editorRowInsertString(erow *row, int at, char *s, size_t len);
 void editorInsertNewLine();
-void editorRowDelChar(erow *row, int at);
+void editorRowDelChar(erow *row, int at, int len);
 void editorRowInsertChar(erow *row, int at, int c);
 void editorRowAppendString(erow *row, char *s, size_t len);
 void editorDelRow(int at);
@@ -272,85 +275,104 @@ int editorReadKey() {
     if (nread == -1 && errno != EAGAIN) die("read");
   }
 
-  if (c != '\x1b') {
-    return c;
+  if (c == '\x1b') {
+    char seq[32] = {0};
+    size_t i = 0;
+    while (i < sizeof(seq) - 1) {
+      if (read(STDIN_FILENO, &seq[i], 1) != 1) break;
+      if (isalpha(seq[i]) || seq[i] == '~') {
+        i++;
+        break;
+      }
+      i++;
+    }
+    if (i == 0) return '\x1b';
+    seq[i] = '\0';
+
+    if (seq[0] == '[') {
+      if (strlen(seq) == 2) {
+          switch(seq[1]) {
+              case 'A': return ARROW_UP;
+              case 'B': return ARROW_DOWN;
+              case 'C': return ARROW_RIGHT;
+              case 'D': return ARROW_LEFT;
+              case 'H': return HOME_KEY;
+              case 'F': return END_KEY;
+          }
+      } else if (seq[strlen(seq) - 1] == '~') {
+          int n;
+          if (sscanf(seq, "[%d~", &n) == 1) {
+              switch (n) {
+                  case 1: return HOME_KEY;
+                  case 3: return DEL_KEY;
+                  case 4: return END_KEY;
+                  case 5: return PAGE_UP;
+                  case 6: return PAGE_DOWN;
+                  case 7: return HOME_KEY;
+                  case 8: return END_KEY;
+              }
+          }
+      } else if (strncmp(seq, "[1;2", 4) == 0 && strlen(seq) == 5) {
+          switch(seq[4]) {
+              case 'A': return SHIFT_ARROW_UP;
+              case 'B': return SHIFT_ARROW_DOWN;
+              case 'C': return SHIFT_ARROW_RIGHT;
+              case 'D': return SHIFT_ARROW_LEFT;
+          }
+      } else if (seq[1] == '<') {
+          int b, x, y;
+          char m;
+          if (sscanf(seq, "[<%d;%d;%d%c", &b, &x, &y, &m) == 4) {
+              if (m == 'M') {
+                  if (b == 64) return MOUSE_WHEEL_UP;
+                  if (b == 65) return MOUSE_WHEEL_DOWN;
+                  E.cx = x - 1;
+                  E.cy = y - 1;
+                  return MOUSE_CLICK;
+              }
+          }
+      }
+    } else if (seq[0] == 'O') {
+      if (strlen(seq) == 2) {
+          switch(seq[1]) {
+              case 'H': return HOME_KEY;
+              case 'F': return END_KEY;
+          }
+      }
+    }
+    return '\x1b';
   }
 
-  char seq[32] = {0};
-  size_t i = 0;
-  // Read the rest of the escape sequence with a timeout
-  while (i < sizeof(seq) - 1) {
-    if (read(STDIN_FILENO, &seq[i], 1) != 1) break;
-    // Heuristic: stop at terminating character
-    if (isalpha(seq[i]) || seq[i] == '~') {
-      i++;
-      break;
+  // Handle UTF-8
+  unsigned char uc = c;
+  if (uc < 0x80) { // ASCII
+    return uc;
+  }
+
+  int len = utf8_char_len_from_byte(uc);
+  if (len == 1) return c; // Invalid start byte
+
+  char seq[4];
+  seq[0] = c;
+  int i = 1;
+  while(i < len) {
+    if (read(STDIN_FILENO, &seq[i], 1) != 1) return '\x1b';
+    if ((seq[i] & 0xC0) != 0x80) { // Not a continuation byte
+        return '\x1b';
     }
     i++;
   }
 
-  // If we didn't read anything, it was a lone Esc press
-  if (i == 0) return '\x1b';
-
-  // Null-terminate for strcmp
-  seq[i] = '\0';
-
-  // Parse the sequence
-  if (seq[0] == '[') {
-    // Standard CSI sequences
-    if (strlen(seq) == 2) {
-        switch(seq[1]) {
-            case 'A': return ARROW_UP;
-            case 'B': return ARROW_DOWN;
-            case 'C': return ARROW_RIGHT;
-            case 'D': return ARROW_LEFT;
-            case 'H': return HOME_KEY;
-            case 'F': return END_KEY;
-        }
-    } else if (seq[strlen(seq) - 1] == '~') {
-        int n;
-        if (sscanf(seq, "[%d~", &n) == 1) {
-            switch (n) {
-                case 1: return HOME_KEY;
-                case 3: return DEL_KEY;
-                case 4: return END_KEY;
-                case 5: return PAGE_UP;
-                case 6: return PAGE_DOWN;
-                case 7: return HOME_KEY;
-                case 8: return END_KEY;
-            }
-        }
-    } else if (strncmp(seq, "[1;2", 4) == 0 && strlen(seq) == 5) {
-        switch(seq[4]) {
-            case 'A': return SHIFT_ARROW_UP;
-            case 'B': return SHIFT_ARROW_DOWN;
-            case 'C': return SHIFT_ARROW_RIGHT;
-            case 'D': return SHIFT_ARROW_LEFT;
-        }
-    } else if (seq[1] == '<') { // SGR Mouse
-        int b, x, y;
-        char m;
-        if (sscanf(seq, "[<%d;%d;%d%c", &b, &x, &y, &m) == 4) {
-            if (m == 'M') { // Press
-                if (b == 64) return MOUSE_WHEEL_UP;
-                if (b == 65) return MOUSE_WHEEL_DOWN;
-                E.cx = x - 1;
-                E.cy = y - 1;
-                return MOUSE_CLICK;
-            }
-        }
-    }
-  } else if (seq[0] == 'O') {
-    if (strlen(seq) == 2) {
-        switch(seq[1]) {
-            case 'H': return HOME_KEY;
-            case 'F': return END_KEY;
-        }
-    }
+  int codepoint = 0;
+  if (len == 2) {
+    codepoint = ((seq[0] & 0x1F) << 6) | (seq[1] & 0x3F);
+  } else if (len == 3) {
+    codepoint = ((seq[0] & 0x0F) << 12) | ((seq[1] & 0x3F) << 6) | (seq[2] & 0x3F);
+  } else if (len == 4) {
+    codepoint = ((seq[0] & 0x07) << 18) | ((seq[1] & 0x3F) << 12) | ((seq[2] & 0x3F) << 6) | (seq[3] & 0x3F);
   }
 
-  // Unrecognized sequence, but we consumed it.
-  return '\x1b';
+  return codepoint;
 }
 
 int getCursorPosition(int *rows, int *cols) {
@@ -756,7 +778,7 @@ void editorUndo() {
   // Perform the INVERSE of the action
   switch (action.type) {
     case ACTION_INSERT_CHAR:
-      editorRowDelChar(&E.row[action.cy], action.cx);
+      editorRowDelChar(&E.row[action.cy], action.cx, 1);
       break;
     case ACTION_DELETE_CHAR:
       editorRowInsertChar(&E.row[action.cy], action.cx, action.data.ch);
@@ -842,7 +864,7 @@ void editorRedo() {
       E.cx++;
       break;
     case ACTION_DELETE_CHAR:
-      editorRowDelChar(&E.row[action.cy], action.cx);
+      editorRowDelChar(&E.row[action.cy], action.cx, 1);
       break;
     case ACTION_SPLIT_LINE: {
       erow *row = &E.row[action.cy];
@@ -902,45 +924,89 @@ void editorRedo() {
 
 int editorRowCxToRx(erow *row, int cx) {
   int rx = 0;
-  int j;
-  for (j = 0; j < cx; j++) {
-    if (row->chars[j] == '\t')
+  int j = 0;
+  wchar_t wc;
+  while (j < cx) {
+    if (row->chars[j] == '\t') {
       rx += (AYA_TAB_STOP - 1) - (rx % AYA_TAB_STOP);
-    rx++;
+      rx++;
+      j++;
+      continue;
+    }
+    int char_bytes = utf8_char_len_from_byte(row->chars[j]);
+    int col_width = 1;
+    if (mbtowc(&wc, &row->chars[j], char_bytes) != -1) {
+        col_width = wcwidth(wc);
+        if (col_width < 0) col_width = 1;
+    }
+    rx += col_width;
+    j += char_bytes;
   }
   return rx;
 }
 
 int editorRowRxToCx(erow *row, int rx) {
   int cur_rx = 0;
-  int cx;
-  for (cx = 0; cx < row->size; cx++) {
-    if (row->chars[cx] == '\t')
+  int cx = 0;
+  wchar_t wc;
+  while (cx < row->size) {
+    if (row->chars[cx] == '\t') {
       cur_rx += (AYA_TAB_STOP - 1) - (cur_rx % AYA_TAB_STOP);
-    cur_rx++;
-    if (cur_rx > rx) return cx;
+      cur_rx++;
+      if (cur_rx > rx) break;
+      cx++;
+      continue;
+    }
+
+    int char_bytes = utf8_char_len_from_byte(row->chars[cx]);
+    int col_width = 1;
+    if (mbtowc(&wc, &row->chars[cx], char_bytes) != -1) {
+        col_width = wcwidth(wc);
+        if (col_width < 0) col_width = 1;
+    }
+
+    if (cur_rx + col_width > rx) break;
+    
+    cur_rx += col_width;
+    cx += char_bytes;
   }
   return cx;
 }
 
 void editorUpdateRow(erow *row) {
   int tabs = 0;
-  int j;
-  for (j = 0; j < row->size; j++)
+  for (int j = 0; j < row->size; j++) {
     if (row->chars[j] == '\t') tabs++;
+  }
   free(row->render);
   row->render = malloc(row->size + tabs * (AYA_TAB_STOP - 1) + 1);
   if (row->render == NULL) {
-
       die("malloc failed in editorUpdateRow");
   }
+
   int idx = 0;
-  for (j = 0; j < row->size; j++) {
+  int rx = 0;
+  wchar_t wc;
+  for (int j = 0; j < row->size; ) {
     if (row->chars[j] == '\t') {
       row->render[idx++] = ' ';
-      while (idx % AYA_TAB_STOP != 0) row->render[idx++] = ' ';
+      rx++;
+      while (rx % AYA_TAB_STOP != 0) {
+        row->render[idx++] = ' ';
+        rx++;
+      }
+      j++;
     } else {
-      row->render[idx++] = row->chars[j];
+      int char_len = utf8_char_len_from_byte(row->chars[j]);
+      int width = 1;
+      if (mbtowc(&wc, &row->chars[j], char_len) > 0) {
+          width = wcwidth(wc);
+          if (width < 0) width = 1;
+      }
+      rx += width;
+      memcpy(&row->render[idx], &row->chars[j], char_len);
+      idx += char_len;
+      j += char_len;
     }
   }
   row->render[idx] = '\0';
@@ -1015,10 +1081,10 @@ void editorRowAppendString(erow *row, char *s, size_t len) {
   E.dirty++;
 }
 
-void editorRowDelChar(erow *row, int at) {
-  if (at < 0 || at >= row->size) return;
-  memmove(&row->chars[at], &row->chars[at + 1], row->size - at);
-  row->size--;
+void editorRowDelChar(erow *row, int at, int len) {
+  if (at < 0 || at + len > row->size) return;
+  memmove(&row->chars[at], &row->chars[at + len], row->size - at - len + 1);
+  row->size -= len;
   editorUpdateRow(row);
   E.dirty++;
 }
@@ -1152,20 +1218,42 @@ void editorInsertChar(int c) {
   if (E.selection_start_cy != -1) {
     editorDeleteSelection();
   }
+
+  char utf8_c[5];
+  int len = 0;
+  if (c < 0x80) {
+    utf8_c[len++] = c;
+  } else if (c < 0x800) {
+    utf8_c[len++] = (c >> 6) | 0xC0;
+    utf8_c[len++] = (c & 0x3F) | 0x80;
+  } else if (c < 0x10000) {
+    utf8_c[len++] = (c >> 12) | 0xE0;
+    utf8_c[len++] = ((c >> 6) & 0x3F) | 0x80;
+    utf8_c[len++] = (c & 0x3F) | 0x80;
+  } else if (c < 0x110000) {
+    utf8_c[len++] = (c >> 18) | 0xF0;
+    utf8_c[len++] = ((c >> 12) & 0x3F) | 0x80;
+    utf8_c[len++] = ((c >> 6) & 0x3F) | 0x80;
+    utf8_c[len++] = (c & 0x3F) | 0x80;
+  }
+  utf8_c[len] = '\0';
+
   if (!E.is_undo_redo) {
     undoAction action;
-    action.type = ACTION_INSERT_CHAR;
+    action.type = ACTION_INSERT_STRING;
     action.cx = E.cx;
     action.cy = E.cy;
-    action.data.ch = c;
+    action.data.string.str = strdup(utf8_c);
+    action.data.string.len = len;
     push_undo_action(action);
+    free(action.data.string.str);
   }
 
   if (E.cy == E.numrows) {
     editorInsertRow(E.numrows, "", 0);
   }
-  editorRowInsertChar(&E.row[E.cy], E.cx, c);
-  E.cx++;
+  editorRowInsertString(&E.row[E.cy], E.cx, utf8_c, len);
+  E.cx += len;
 }
 
 void editorInsertNewLine() {
@@ -1222,16 +1310,31 @@ void editorDelChar() {
 
   erow *row = &E.row[E.cy];
   if (E.cx > 0) {
+    int char_len = 1;
+    int i = E.cx - 1;
+    while(i > 0 && (row->chars[i] & 0xC0) == 0x80) {
+        i--;
+    }
+    if (i < E.cx) {
+        char_len = utf8_char_len_from_byte(row->chars[i]);
+    }
+
+
     if (!E.is_undo_redo) {
       undoAction action;
-      action.type = ACTION_DELETE_CHAR;
-      action.cx = E.cx - 1;
+      action.type = ACTION_DELETE_STRING;
       action.cy = E.cy;
-      action.data.ch = row->chars[E.cx - 1];
+      action.cx = E.cx - char_len;
+      action.data.string.str = malloc(char_len + 1);
+      strncpy(action.data.string.str, &row->chars[E.cx - char_len], char_len);
+      action.data.string.str[char_len] = '\0';
+      action.data.string.len = char_len;
       push_undo_action(action);
+      free(action.data.string.str);
     }
-    editorRowDelChar(row, E.cx - 1);
-    E.cx--;
+    editorRowDelChar(row, E.cx - char_len, char_len);
+    E.cx -= char_len;
+
   } else {
     if (!E.is_undo_redo) {
       undoAction action;
@@ -1439,64 +1542,70 @@ void editorDrawRows(struct abuf *ab) {
         abAppend(ab, "~", 1);
       }
     } else {
-      int len = E.row[filerow].rsize - E.coloff;
-      if (len < 0) len = 0;
-      if (len > E.screencols) len = E.screencols;
-      char *c = &E.row[filerow].render[E.coloff];
-      unsigned char *hl = &E.row[filerow].hl[E.coloff];
+      erow *row = &E.row[filerow];
+      int rx = 0;
+      int current_color_applied = 39;
+      int current_invert_applied = 0;
       
-      int current_color_applied = 39; // Start with default foreground color
-      int current_invert_applied = 0; // 0 for no invert, 1 for invert
-      
-      int j = 0;
-      while (j < len) {
-        int char_len = utf8_char_len_from_byte(c[j]);
-        if (j + char_len > len) char_len = 1;
+      for (int j = 0; j < row->rsize; ) {
+          int char_len = utf8_char_len_from_byte(row->render[j]);
+          int width = 1;
+          wchar_t wc;
+           if (mbtowc(&wc, &row->render[j], char_len) > 0) {
+              width = wcwidth(wc);
+              if (width < 0) width = 1;
+          } else {
+              // Invalid UTF-8 sequence, treat as single byte
+              char_len = 1;
+              width = 1;
+          }
 
-        int is_sel_for_this_char = is_selected(filerow, editorRowRxToCx(&E.row[filerow], E.coloff + j));
-        int color_for_this_char = editorSyntaxToColor(hl[j]);
+          if (rx >= E.coloff) {
+              if (rx >= E.coloff + E.screencols) break;
 
-        // Manage inversion (selection)
-        if (is_sel_for_this_char && !current_invert_applied) {
-          abAppend(ab, "\x1b[7m", 4); // Turn on inversion
-          current_invert_applied = 1;
-        } else if (!is_sel_for_this_char && current_invert_applied) {
-          abAppend(ab, "\x1b[27m", 5); // Turn off inversion
-          current_invert_applied = 0;
-        }
+              // --- Logic from original function, now inside the visibility check ---
+              int is_sel_for_this_char = is_selected(filerow, j);
+              int color_for_this_char = editorSyntaxToColor(row->hl[j]);
 
-        // Manage color
-        if (color_for_this_char != current_color_applied) {
-          current_color_applied = color_for_this_char;
-          char buf[16];
-          int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", current_color_applied);
-          abAppend(ab, buf, clen);
-        }
+              if (is_sel_for_this_char && !current_invert_applied) {
+                abAppend(ab, "\x1b[7m", 4);
+                current_invert_applied = 1;
+              } else if (!is_sel_for_this_char && current_invert_applied) {
+                abAppend(ab, "\x1b[27m", 5);
+                current_invert_applied = 0;
+              }
 
-        // Handle control characters (they override styling for their symbol)
-        if (iscntrl(c[j])) {
-          char sym = (c[j] <= 26) ? '@' + c[j] : '?';
-          // Reset all attributes, then apply reverse video for the symbol
-          abAppend(ab, "\x1b[m", 3); 
-          abAppend(ab, "\x1b[7m", 4); 
-          abAppend(ab, &sym, 1);
-          abAppend(ab, "\x1b[m", 3); // Reset after symbol
-          
-          // Force re-evaluation of color and invert state for next character
-          current_color_applied = 39; 
-          current_invert_applied = 0; 
-        } else {
-          // Normal character: just append it
-          abAppend(ab, &c[j], char_len);
-        }
-        j += char_len;
+              if (color_for_this_char != current_color_applied) {
+                current_color_applied = color_for_this_char;
+                char buf[16];
+                int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", current_color_applied);
+                abAppend(ab, buf, clen);
+              }
+
+              if (iscntrl(row->render[j])) {
+                char sym = (row->render[j] <= 26) ? '@' + row->render[j] : '?';
+                abAppend(ab, "\x1b[m", 3); 
+                abAppend(ab, "\x1b[7m", 4); 
+                abAppend(ab, &sym, 1);
+                abAppend(ab, "\x1b[m", 3);
+                current_color_applied = 39; 
+                current_invert_applied = 0; 
+              } else {
+                abAppend(ab, &row->render[j], char_len);
+              }
+              // --- End of original logic ---
+          }
+
+          rx += width;
+          j += char_len;
       }
+      
       // After the loop, ensure everything is reset to default
       if (current_invert_applied) {
-        abAppend(ab, "\x1b[27m", 5); // Turn off inversion
+        abAppend(ab, "\x1b[27m", 5);
       }
       if (current_color_applied != 39) {
-        abAppend(ab, "\x1b[39m", 5); // Reset to default foreground color
+        abAppend(ab, "\x1b[39m", 5);
       }
     }
     abAppend(ab, "\x1b[K", 3);
@@ -1651,7 +1760,16 @@ void editorMoveCursor(int key) {
   switch (key) {
     case ARROW_LEFT:
       if (E.cx != 0) {
-        E.cx--;
+        int prev_char_len = 1;
+        int i = E.cx - 1;
+        while(i > 0 && (row->chars[i] & 0xC0) == 0x80) {
+            i--;
+        }
+        if (i < E.cx) {
+            prev_char_len = utf8_char_len_from_byte(row->chars[i]);
+             if (E.cx - i != prev_char_len) prev_char_len = 1;
+        }
+        E.cx -= prev_char_len;
       } else if (E.cy > 0) {
         E.cy--;
         E.cx = E.row[E.cy].size;
@@ -1659,7 +1777,7 @@ void editorMoveCursor(int key) {
       break;
     case ARROW_RIGHT:
       if (row && E.cx < row->size) {
-        E.cx++;
+        E.cx += utf8_char_len_from_byte(row->chars[E.cx]);
       } else if (row && E.cx == row->size) {
         E.cy++;
         E.cx = 0;
@@ -1930,6 +2048,7 @@ void display_help() {
 }
 
 int main(int argc, char *argv[]) {
+  setlocale(LC_ALL, "");
   if (argc >= 2) {
     if (strcmp(argv[1], "--help") == 0) {
       display_help();
