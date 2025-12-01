@@ -350,14 +350,14 @@ int editorReadKey() {
   }
 
   int len = utf8_char_len_from_byte(uc);
-  if (len == 1) return c; // Invalid start byte
+  if (len == 1) return c;
 
   char seq[4];
   seq[0] = c;
   int i = 1;
   while(i < len) {
     if (read(STDIN_FILENO, &seq[i], 1) != 1) return '\x1b';
-    if ((seq[i] & 0xC0) != 0x80) { // Not a continuation byte
+    if ((seq[i] & 0xC0) != 0x80) {
         return '\x1b';
     }
     i++;
@@ -411,7 +411,7 @@ int utf8_char_len_from_byte(unsigned char byte) {
     if ((byte & 0xE0) == 0xC0) return 2;
     if ((byte & 0xF0) == 0xE0) return 3;
     if ((byte & 0xF8) == 0xF0) return 4;
-    return 1; // Not a valid start byte, treat as single byte
+    return 1;
 }
 
 void editorUpdateSyntax(erow *row) {
@@ -515,7 +515,6 @@ void editorUpdateSyntax(erow *row) {
                                             j++; // Move to next character if not space, string, or number
                                         }
                                     }                }
-                // This break is crucial for preprocessor directives to be handled fully and not re-parsed as other syntax
                 break;
             }
     
