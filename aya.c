@@ -18,7 +18,7 @@
 #include <wchar.h>
 
 
-#define AYA_VERSION "0.0.4"
+#define AYA_VERSION "0.0.6"
 #define AYA_TAB_STOP 8
 #define AYA_QUIT_TIMES 3
 
@@ -198,6 +198,7 @@ struct editorConfig {
   int redo_count;
   int redo_capacity;
   int is_undo_redo;
+  int initial_line;
 };
 
 struct editorConfig E;
@@ -216,6 +217,7 @@ void editorClearSelection();
 int is_selected(int filerow, int cx);
 char *editorGetSelectedString();
 void editorDeleteSelection();
+void editorGoToLine();
 int utf8_char_len_from_byte(unsigned char byte);
 void editorUpdateSyntax(erow *row);
 void editorSelectSyntaxHighlight();
@@ -420,13 +422,9 @@ void editorUpdateSyntax(erow *row) {
         row->hl = NULL;
         return;
     }
-    row->hl = realloc(row->hl, row->rsize);
-    if (row->hl == NULL) {
-    
-        die("realloc failed in editorUpdateSyntax");
-    }
-    memset(row->hl, HL_NORMAL, row->rsize);
-    if (E.syntax == NULL) return;
+      row->hl = realloc(row->hl, row->rsize);
+      if (!row->hl) die("realloc failed in editorDrawRows");
+      memset(row->hl, HL_NORMAL, row->rsize);    if (E.syntax == NULL) return;
     char **keywords = E.syntax->keywords;
     char *scs = E.syntax->singleline_comment_start;
     char *mcs = E.syntax->multiline_comment_start;
@@ -653,12 +651,10 @@ struct abuf {
 #define ABUF_INIT {NULL, 0}
 
 void abAppend(struct abuf *ab, const char *s, int len) {
-    char *new = realloc(ab->b, ab->len + len + 1); // +1 for null terminator
-    if (new == NULL) die("realloc failed in abAppend");
-    memcpy(new + ab->len, s, len);
-    new[ab->len + len] = '\0';
-
-    ab->b = new;
+    char *new_b = realloc(ab->b, ab->len + len);
+    if (new_b == NULL) die("realloc failed in abAppend");
+    memcpy(new_b + ab->len, s, len);
+    ab->b = new_b;
     ab->len += len;
 }
 
@@ -678,7 +674,7 @@ void clear_undo_stack(undoAction **stack, int *count, int *capacity);
 void push_action(undoAction **stack, int *count, int *capacity, undoAction action) {
     if (*capacity == *count) {
         *capacity = *capacity < 8 ? 8 : *capacity * 2;
-        undoAction *new_stack = realloc(*stack, sizeof(undoAction) * (*capacity));
+        void *new_stack = realloc(*stack, sizeof(undoAction) * (*capacity));
         if (!new_stack) die("realloc failed in push_action");
         *stack = new_stack;
     }
@@ -686,8 +682,8 @@ void push_action(undoAction **stack, int *count, int *capacity, undoAction actio
     if (action.type == ACTION_DELETE_STRING || action.type == ACTION_INSERT_STRING ||
         action.type == ACTION_JOIN_LINES || action.type == ACTION_SPLIT_LINE) {
         if (action.data.string.str != NULL) {
-            char *new_str = strdup(action.data.string.str);
-            if (!new_str) die("strdup failed in push_action");
+            char *new_str = strndup(action.data.string.str, action.data.string.len);
+            if (!new_str) die("strndup failed in push_action");
             action.data.string.str = new_str;
         } else {
             action.data.string.str = NULL;
@@ -979,9 +975,7 @@ void editorUpdateRow(erow *row) {
   }
   free(row->render);
   row->render = malloc(row->size + tabs * (AYA_TAB_STOP - 1) + 1);
-  if (row->render == NULL) {
-      die("malloc failed in editorUpdateRow");
-  }
+  if (!row->render) die("malloc failed in editorUpdateRow");
 
   int idx = 0;
   int rx = 0;
@@ -1017,10 +1011,7 @@ void editorInsertRow(int at, char *s, size_t len) {
   if (at < 0 || at > E.numrows) return;
 
   E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
-  if (E.row == NULL) {
-
-      die("realloc failed in editorInsertRow");
-  }
+  if (!E.row) die("realloc failed in editorInsertRow");
   if (at < E.numrows) {
     memmove(&E.row[at + 1], &E.row[at], sizeof(erow) * (E.numrows - at));
   }
@@ -1028,6 +1019,7 @@ void editorInsertRow(int at, char *s, size_t len) {
   E.row[at].idx = at;
   E.row[at].size = len;
   E.row[at].chars = malloc(len + 1);
+  if (!E.row[at].chars) die("malloc failed in editorInsertRow");
   memcpy(E.row[at].chars, s, len);
   E.row[at].chars[len] = '\0';
   E.row[at].rsize = 0;
@@ -1064,6 +1056,7 @@ void editorDelRow(int at) {
 void editorRowInsertChar(erow *row, int at, int c) {
   if (at < 0 || at > row->size) at = row->size;
   row->chars = realloc(row->chars, row->size + 2);
+  if (!row->chars) die("realloc failed in editorRowInsertChar");
   memmove(&row->chars[at + 1], &row->chars[at], row->size - at + 1);
   row->size++;
   row->chars[at] = c;
@@ -1073,6 +1066,7 @@ void editorRowInsertChar(erow *row, int at, int c) {
 
 void editorRowAppendString(erow *row, char *s, size_t len) {
   row->chars = realloc(row->chars, row->size + len + 1);
+  if (!row->chars) die("realloc failed in editorRowAppendString");
   memcpy(&row->chars[row->size], s, len);
   row->size += len;
   row->chars[row->size] = '\0';
@@ -1122,6 +1116,7 @@ char *editorGetSelectedString() {
 
   // ここで strdup して返す
   char *ret = strdup(ab.b ? ab.b : "");
+  if (!ret) die("strdup failed in editorGetSelectedString");
   abFree(&ab); // ab の内部バッファを解放
   return ret;
 }
@@ -1148,6 +1143,7 @@ void editorDeleteSelection() {
         action.cx = start_x;
         action.cy = start_y;
         action.data.string.str = strdup(selected); // 既存 push_undo_action と同等
+        if (!action.data.string.str) die("strdup failed in editorDeleteSelection");
         action.data.string.len = strlen(selected);
         push_undo_action(action);
 
@@ -1243,6 +1239,7 @@ void editorInsertChar(int c) {
     action.cx = E.cx;
     action.cy = E.cy;
     action.data.string.str = strdup(utf8_c);
+    if (!action.data.string.str) die("strdup failed in editorInsertChar");
     action.data.string.len = len;
     push_undo_action(action);
     free(action.data.string.str);
@@ -1271,13 +1268,16 @@ void editorInsertNewLine() {
             erow *row = &E.row[E.cy];
             if (E.cx <= row->size) {
                 action.data.string.str = strdup(&row->chars[E.cx]);
+                if (!action.data.string.str) die("strdup failed in editorInsertNewLine");
                 action.data.string.len = row->size - E.cx;
             } else {
                 action.data.string.str = strdup("");
+                if (!action.data.string.str) die("strdup failed in editorInsertNewLine");
                 action.data.string.len = 0;
             }
         } else {
             action.data.string.str = strdup("");
+            if (!action.data.string.str) die("strdup failed in editorInsertNewLine");
             action.data.string.len = 0;
         }
 
@@ -1324,12 +1324,9 @@ void editorDelChar() {
       action.type = ACTION_DELETE_STRING;
       action.cy = E.cy;
       action.cx = E.cx - char_len;
-      action.data.string.str = malloc(char_len + 1);
-      strncpy(action.data.string.str, &row->chars[E.cx - char_len], char_len);
-      action.data.string.str[char_len] = '\0';
+      action.data.string.str = &row->chars[E.cx - char_len];
       action.data.string.len = char_len;
       push_undo_action(action);
-      free(action.data.string.str);
     }
     editorRowDelChar(row, E.cx - char_len, char_len);
     E.cx -= char_len;
@@ -1341,6 +1338,7 @@ void editorDelChar() {
       action.cx = E.row[E.cy - 1].size;
       action.cy = E.cy - 1;
       action.data.string.str = strdup(row->chars);
+      if (!action.data.string.str) die("strdup failed in editorDelChar");
       action.data.string.len = row->size;
       push_undo_action(action);
       free(action.data.string.str);
@@ -1362,6 +1360,7 @@ char *editorRowsToString(int *buflen) {
   }
   *buflen = totlen;
   char *buf = malloc(totlen);
+  if (!buf) die("malloc failed in editorRowsToString");
   char *p = buf;
   for (j = 0; j < E.numrows; j++) {
     memcpy(p, E.row[j].chars, E.row[j].size);
@@ -1375,6 +1374,7 @@ char *editorRowsToString(int *buflen) {
 void editorOpen(char *filename) {
   free(E.filename);
   E.filename = strdup(filename);
+  if (!E.filename) die("strdup failed in editorOpen");
   FILE *fp = fopen(filename, "r");
   if (!fp) {
     if (errno != ENOENT) {
@@ -1394,6 +1394,16 @@ void editorOpen(char *filename) {
   fclose(fp);
   E.dirty = 0;
   editorSelectSyntaxHighlight();
+
+  if (E.initial_line > 0) {
+    E.cy = E.initial_line - 1;
+    if (E.cy >= E.numrows) {
+      E.cy = E.numrows -1;
+    }
+     if (E.cy < 0) {
+      E.cy = 0;
+    }
+  }
 }
 
 void editorSave() {
@@ -1444,6 +1454,24 @@ void editorFind() {
   free(query);
 }
 
+void editorGoToLine() {
+  char *line_str = editorPrompt("行へ移動: %s (Esc でキャンセル)", NULL);
+  if (line_str == NULL) {
+    editorSetStatusMessage("移動はキャンセルされました。");
+    return;
+  }
+
+  int line_num = atoi(line_str);
+  free(line_str);
+
+  if (line_num > 0 && line_num <= E.numrows) {
+    E.cy = line_num - 1; // Adjust for 0-based index
+    E.cx = 0; // Move cursor to the beginning of the line
+  } else {
+    editorSetStatusMessage("無効な行番号です: %d", line_num);
+  }
+}
+
 void editorFindCallback(char *query, int key) {
     static int last_match_cy = -1;
     static int last_match_cx = -1;
@@ -1460,6 +1488,7 @@ void editorFindCallback(char *query, int key) {
     if (current_query == NULL || strcmp(query, current_query) != 0) {
         if(current_query) free(current_query);
         current_query = strdup(query);
+        if (!current_query) die("strdup failed in editorFindCallback");
         last_match_cy = -1;
         last_match_cx = -1;
     }
@@ -1699,6 +1728,7 @@ void editorSetStatusMessage(const char *fmt, ...) {
 char *editorPrompt(char *prompt, void (*callback)(char *, int)) {
   size_t bufsize = 128;
   char *buf = malloc(bufsize);
+  if (!buf) die("malloc failed in editorPrompt");
   size_t buflen = 0;
   buf[0] = '\0';
   while (1) {
@@ -1725,7 +1755,9 @@ char *editorPrompt(char *prompt, void (*callback)(char *, int)) {
     } else if (!iscntrl(c) && c < 128) {
       if (buflen == bufsize - 1) {
         bufsize *= 2;
-        buf = realloc(buf, bufsize);
+        void *temp = realloc(buf, bufsize);
+        if (!temp) die("realloc failed in editorPrompt");
+        buf = temp;
       }
       buf[buflen++] = c;
       buf[buflen] = '\0';
@@ -1995,6 +2027,8 @@ void editorProcessKeypress() {
       }
       break;
     case CTRL_KEY('l'):
+      editorGoToLine();
+      break;
     case '\x1b':
       break;
     default:
@@ -2030,6 +2064,7 @@ void initEditor() {
   E.redo_count = 0;
   E.redo_capacity = 0;
   E.is_undo_redo = 0;
+  E.initial_line = 0;
   if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
   E.screenrows -= 2;
 }
@@ -2044,25 +2079,48 @@ void display_help() {
   printf("オプション:\n");
   printf("  --help     このヘルプメッセージの表示\n");
   printf("  --version  バージョン情報の表示\n");
+  printf("  -l <line>  指定行でファイルを開く\n");
 }
 
 int main(int argc, char *argv[]) {
   setlocale(LC_ALL, "");
-  if (argc >= 2) {
-    if (strcmp(argv[1], "--help") == 0) {
+
+  char *filepath = NULL;
+  int initial_line = 0;
+
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--help") == 0) {
       display_help();
       return 0;
-    } else if (strcmp(argv[1], "--version") == 0) {
+    } else if (strcmp(argv[i], "--version") == 0) {
       display_version();
       return 0;
+    } else if (strcmp(argv[i], "-l") == 0) {
+      if (i + 1 < argc) {
+        initial_line = atoi(argv[i + 1]);
+        i++; // Skip the line number argument
+      } else {
+        fprintf(stderr, "エラー: -l オプションには行番号が必要です。\n");
+        return 1;
+      }
+    } else {
+      if (filepath == NULL) {
+        filepath = argv[i];
+      } else {
+        fprintf(stderr, "エラー: 複数のファイルパスが指定されています。\n");
+        return 1;
+      }
     }
   }
 
   enableRawMode();
   initEditor();
-  if (argc >= 2) {
-    editorOpen(argv[1]);
+  E.initial_line = initial_line;
+
+  if (filepath != NULL) {
+    editorOpen(filepath);
   }
+
   editorSetStatusMessage("ヘルプ: ctrl+S = 保存 | ctrl+Q = 終了 | ctrl+F = 検索");
   while (1) {
     editorRefreshScreen();
