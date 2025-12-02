@@ -18,7 +18,7 @@
 #include <wchar.h>
 
 
-#define AYA_VERSION "0.0.8"
+#define AYA_VERSION "0.0.9"
 #define AYA_TAB_STOP 8
 #define AYA_QUIT_TIMES 3
 
@@ -1183,12 +1183,11 @@ void editorDeleteSelection() {
         action.type = ACTION_DELETE_STRING;
         action.cx = start_x;
         action.cy = start_y;
-        action.data.string.str = strdup(selected); // 既存 push_undo_action と同等
-        if (!action.data.string.str) die("strdup failed in editorDeleteSelection");
+        action.data.string.str = selected;
         action.data.string.len = strlen(selected);
         push_undo_action(action);
+        free(action.data.string.str);
 
-        free(selected); // ← 追加: editorGetSelectedString の戻り値は free 必須
         selected = NULL;
       }
     }
