@@ -17,8 +17,7 @@
 #include <unistd.h>
 #include <wchar.h>
 
-
-#define AYA_VERSION "0.0.9"
+#define AYA_VERSION "0.1.0"
 #define AYA_TAB_STOP 8
 #define AYA_QUIT_TIMES 3
 
@@ -208,7 +207,7 @@ struct editorConfig E;
 
 void editorSetStatusMessage(const char *fmt, ...);
 void editorRefreshScreen();
-char *editorPrompt(char *prompt, void (*callback)(char *, int));
+char *editorPrompt(char *prompt, void (*callback)(int, int));
 void editorMoveCursor(int key);
 void editorInsertString(char *s, int len);
 void editorUndo();
@@ -231,6 +230,10 @@ void editorDelRow(int at);
 void editorInsertRow(int at, char *s, size_t len);
 void editorUpdateRow(erow *row);
 void editorDelChar();
+void editorScroll();
+void editorReplace();
+
+
 // undo 系関数のプロトタイプ
 void push_action(undoAction **stack, int *count, int *capacity, undoAction action);
 void push_undo_action(undoAction action);
@@ -238,6 +241,13 @@ void push_undo_action(undoAction action);
 // editorDeleteSelection
 char *editorGetSelectedString();
 void editorDeleteSelection();
+
+static char find_buffer[256];
+static char replace_buffer[256];
+
+const char *editorGetReplaceBuffer() {
+    return replace_buffer;
+}
 
 /*** terminal ***/
 
@@ -646,12 +656,12 @@ int editorSyntaxToColor(int hl) {
 
 struct abuf {
   char *b;
-  int len;
+  size_t len;
 };
 
 #define ABUF_INIT {NULL, 0}
 
-void abAppend(struct abuf *ab, const char *s, int len) {
+void abAppend(struct abuf *ab, const char *s, size_t len) {
     char *new_b = realloc(ab->b, ab->len + len);
     if (new_b == NULL) die("realloc failed in abAppend");
     memcpy(new_b + ab->len, s, len);
@@ -971,11 +981,13 @@ int editorRowRxToCx(erow *row, int rx) {
 
 void editorUpdateRow(erow *row) {
   int tabs = 0;
+  if (row->size < 0) row->size = 0;
   for (int j = 0; j < row->size; j++) {
     if (row->chars[j] == '\t') tabs++;
   }
   free(row->render);
-  row->render = malloc(row->size + tabs * (AYA_TAB_STOP - 1) + 1);
+  size_t render_size = (size_t)row->size + (size_t)tabs * (AYA_TAB_STOP - 1) + 1;
+  row->render = malloc(render_size);
   if (!row->render) die("malloc failed in editorUpdateRow render");
 
   int idx = 0; // index for row->render
@@ -986,7 +998,7 @@ void editorUpdateRow(erow *row) {
   // Simultaneously, build render_to_chars_map
   free(row->render_to_chars_map);
   // Allocate generously, will realloc later if needed. Max possible size for render is row->size + tabs * (AYA_TAB_STOP - 1)
-  row->render_to_chars_map = malloc(sizeof(int) * (row->size + tabs * (AYA_TAB_STOP - 1) + 1));
+  row->render_to_chars_map = malloc(sizeof(int) * render_size);
   if (!row->render_to_chars_map) die("malloc failed for map in editorUpdateRow map");
 
   int chars_byte_idx = 0; // Tracks byte index in row->chars
@@ -1394,8 +1406,8 @@ void editorDelChar() {
 
 /*** file i/o ***/
 
-char *editorRowsToString(int *buflen) {
-  int totlen = 0;
+char *editorRowsToString(size_t *buflen) {
+  size_t totlen = 0;
   int j;
   for (j = 0; j < E.numrows; j++) {
     totlen += E.row[j].size + 1;
@@ -1457,16 +1469,16 @@ void editorSave() {
     }
     editorSelectSyntaxHighlight();
   }
-  int len;
+  size_t len;
   char *buf = editorRowsToString(&len);
   int fd = open(E.filename, O_RDWR | O_CREAT, 0644);
   if (fd != -1) {
     if (ftruncate(fd, len) != -1) {
-      if (write(fd, buf, len) == len) {
+      if ((size_t)write(fd, buf, len) == len) {
         close(fd);
         free(buf);
         E.dirty = 0;
-        editorSetStatusMessage("%d バイトが書き込まれました。", len);
+        editorSetStatusMessage("%zu バイトが書き込まれました。", len);
         return;
       }
     }
@@ -1476,8 +1488,198 @@ void editorSave() {
   editorSetStatusMessage("書き込めません！ I/O エラー: %s", strerror(errno));
 }
 
-/*** find ***/
-void editorFindCallback(char *query, int key);
+void editorReplace() {
+    if (E.cy >= E.numrows) return;
+
+    erow *row = &E.row[E.cy];
+    
+    // Check if the cursor is at the beginning of a match in the chars buffer
+    char *match_in_chars = strstr(row->chars, find_buffer);
+    if (match_in_chars == NULL || match_in_chars != &row->chars[E.cx]) {
+        // Only replace if the cursor is at the beginning of a match in the chars buffer
+        return;
+    }
+
+    if (strlen(find_buffer) == 0) { // Special case: replace line if find is empty
+        const char* replace_query = editorGetReplaceBuffer();
+        // Clear the current line
+        row->size = 0;
+        if (row->chars) {
+            free(row->chars);
+            row->chars = NULL;
+        }
+        // Insert the replacement string
+        editorRowInsertString(row, 0, (char*)replace_query, strlen(replace_query));
+        return;
+    }
+    
+    editorRowDelChar(row, E.cx, strlen(find_buffer));
+    editorRowInsertString(row, E.cx, (char*)replace_buffer, strlen(replace_buffer));
+}
+
+void editorFindCallback(int key, int active_field) {
+
+    static int last_match_cy = -1;
+
+    static int last_match_cx = -1; 
+
+    static int direction = 1;
+
+
+
+    if (key == '\t' || key == '\x1b') {
+
+        last_match_cy = -1;
+
+        last_match_cx = -1;
+
+        direction = 1;
+
+        return;
+
+    }
+
+    
+
+    if (key == '\r') {
+
+        if (active_field == 1) { 
+
+            editorReplace();
+
+        } else {
+
+             if (strlen(replace_buffer) == 0) {
+
+                 return; 
+
+             }
+
+        }
+
+        direction = 1; 
+
+    } else if (key == ARROW_DOWN || key == ARROW_RIGHT) {
+
+        direction = 1;
+
+    } else if (key == ARROW_UP || key == ARROW_LEFT) {
+
+        direction = -1;
+
+    } else { 
+
+        last_match_cy = -1;
+
+        last_match_cx = -1;
+
+        direction = 1;
+
+    }
+
+    
+
+    if (strlen(find_buffer) == 0) return;
+
+    
+
+    if (last_match_cy == -1) {
+
+      direction = 1;
+
+      last_match_cy = 0;
+
+      last_match_cx = -1;
+
+    }
+
+
+
+    int start_row = last_match_cy;
+
+    for (int i = 0; i < E.numrows; i++) {
+
+        int row_idx = start_row;
+
+        if (direction == 1) {
+
+            row_idx = (start_row + i) % E.numrows;
+
+        } else {
+
+            row_idx = (start_row - i + E.numrows) % E.numrows;
+
+        }
+
+
+
+        erow *row = &E.row[row_idx];
+
+        char *match = NULL;
+
+        
+
+        if (direction == 1) {
+
+            int start_cx = (row_idx == last_match_cy) ? last_match_cx + 1 : 0;
+
+            if (start_cx <= row->size) {
+
+                 match = strstr(row->chars + start_cx, find_buffer);
+
+            }
+
+        } else { // Backward search
+
+            int start_cx = (row_idx == last_match_cy) ? last_match_cx : row->size;
+
+            char *p = row->chars;
+
+            char *last_match_ptr = NULL;
+
+            while(p < row->chars + start_cx) {
+
+                char *m = strstr(p, find_buffer);
+
+                if (m && m < row->chars + start_cx) {
+
+                    last_match_ptr = m;
+
+                    p = m + 1;
+
+                } else {
+
+                    break;
+
+                }
+
+            }
+
+            match = last_match_ptr;
+
+        }
+
+
+
+        if (match) {
+
+            last_match_cy = row_idx;
+
+            last_match_cx = match - row->chars;
+
+            E.cy = row_idx;
+
+            E.cx = last_match_cx;
+
+            editorScroll();
+
+            return;
+
+        }
+
+    }
+
+}
 
 void editorFind() {
   int saved_cx = E.cx;
@@ -1485,7 +1687,7 @@ void editorFind() {
   int saved_coloff = E.coloff;
   int saved_rowoff = E.rowoff;
 
-  char *query = editorPrompt("検索: %s (Esc でキャンセル, Enterで次へ)", editorFindCallback);
+  char *query = editorPrompt("Find: %s | Replace: %s", (void(*)(int,int))editorFindCallback);
 
   if (query == NULL) { // Search was cancelled
     E.cx = saved_cx;
@@ -1507,66 +1709,11 @@ void editorGoToLine() {
   free(line_str);
 
   if (line_num > 0 && line_num <= E.numrows) {
-    E.cy = line_num - 1; // Adjust for 0-based index
-    E.cx = 0; // Move cursor to the beginning of the line
+    E.cy = line_num - 1;
+    E.cx = 0;
   } else {
     editorSetStatusMessage("無効な行番号です: %d", line_num);
   }
-}
-
-void editorFindCallback(char *query, int key) {
-    static int last_match_cy = -1;
-    static int last_match_cx = -1;
-    static char *current_query = NULL;
-
-    if (key == '\x1b') {
-        last_match_cy = -1;
-        last_match_cx = -1;
-        if(current_query) free(current_query);
-        current_query = NULL;
-        return;
-    }
-
-    if (current_query == NULL || strcmp(query, current_query) != 0) {
-        if(current_query) free(current_query);
-        current_query = strdup(query);
-        if (!current_query) die("strdup failed in editorFindCallback");
-        last_match_cy = -1;
-        last_match_cx = -1;
-    }
-
-    if (key != '\r') { // new char typed
-        last_match_cy = -1;
-        last_match_cx = -1;
-    }
-
-    int start_cy = last_match_cy == -1 ? 0 : last_match_cy;
-    int start_cx = last_match_cx == -1 ? 0 : last_match_cx;
-
-    if (key == '\r') {
-        start_cx++;
-    }
-
-    for (int i = 0; i < E.numrows; i++) {
-        int current_cy = (start_cy + i) % E.numrows;
-        erow *row = &E.row[current_cy];
-
-        char *match;
-        if (i == 0) {
-            if (start_cx >= row->size) continue;
-            match = strstr(&row->render[start_cx], query);
-        } else {
-            match = strstr(row->render, query);
-        }
-
-        if (match) {
-            last_match_cy = current_cy;
-            last_match_cx = match - row->render;
-            E.cy = current_cy;
-            E.cx = editorRowRxToCx(row, last_match_cx);
-            return;
-        }
-    }
 }
 
 /*** output ***/
@@ -1640,8 +1787,8 @@ void editorDrawRows(struct abuf *ab) {
       if (E.syntax) {
         char line_num_str[16];
         int len = snprintf(line_num_str, sizeof(line_num_str), "%*d ", line_num_width -1, filerow + 1);
-        abAppend(ab, "\x1b[38;5;240m", 11); // Dim gray color
-        abAppend(ab, line_num_str, len);
+        abAppend(ab, "\x1b[38;5;240m", 11);
+        abAppend(ab, line_num_str, (size_t)len);
         abAppend(ab, "\x1b[39m", 5);
       }
 
@@ -1685,7 +1832,7 @@ void editorDrawRows(struct abuf *ab) {
                 current_color_applied = color_for_this_char;
                 char buf[16];
                 int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", current_color_applied);
-                abAppend(ab, buf, clen);
+                abAppend(ab, buf, (size_t)clen);
               }
 
               if (iscntrl(row->render[j])) {
@@ -1697,7 +1844,7 @@ void editorDrawRows(struct abuf *ab) {
                 current_color_applied = 39; 
                 current_invert_applied = 0; 
               } else {
-                abAppend(ab, &row->render[j], char_len);
+                abAppend(ab, &row->render[j], (size_t)char_len);
               }
           }
           rx += width;
@@ -1717,19 +1864,18 @@ void editorDrawRows(struct abuf *ab) {
 }
 
 
-
 void editorDrawStatusBar(struct abuf *ab) {
     abAppend(ab, "\x1b[7m", 4);
     char status[80], rstatus[80];
     int len = snprintf(status, sizeof(status), "%.20s - %d 行 %s",
-        E.filename ? E.filename : "無題]", E.numrows, E.dirty ? "(変更済)" : "");
+        E.filename ? E.filename : "[無題]", E.numrows, E.dirty ? "(変更済)" : "");
     int rlen = snprintf(rstatus, sizeof(rstatus), "%s | %d/%d",
         E.syntax ? E.syntax->filetype : "no ft", E.cy + 1, E.numrows);
     if (len > E.screencols) len = E.screencols;
-    abAppend(ab, status, len);
+    abAppend(ab, status, (size_t)len);
     while (len < E.screencols) {
         if (E.screencols - len == rlen) {
-            abAppend(ab, rstatus, rlen);
+            abAppend(ab, rstatus, (size_t)rlen);
             break;
         } else {
             abAppend(ab, " ", 1);
@@ -1763,7 +1909,7 @@ void editorDrawMessageBar(struct abuf *ab) {
             break;
         }
         
-        abAppend(ab, &E.statusmsg[i], char_bytes);
+        abAppend(ab, &E.statusmsg[i], (size_t)char_bytes);
         display_width += col_width;
         i += char_bytes;
     }
@@ -1790,12 +1936,12 @@ void editorRefreshScreen() {
           temp /= 10;
           line_num_width++;
       }
-      line_num_width += 1; // for space
+      line_num_width += 1;
   }
 
   char buf[32];
   snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 2, (E.rx - E.coloff) + 1 + line_num_width);
-  abAppend(&ab, buf, strlen(buf));
+  abAppend(&ab, buf, (size_t)strlen(buf));
   
   abAppend(&ab, "\x1b[?25h", 6);
   
@@ -1813,70 +1959,130 @@ void editorSetStatusMessage(const char *fmt, ...) {
 
 /*** input ***/
 
-char *editorPrompt(char *prompt, void (*callback)(char *, int)) {
-  size_t bufsize = 128;
+char *editorPrompt(char *prompt, void (*callback)(int, int)) {
+  int is_fr_prompt = (strstr(prompt, "Find:") && strstr(prompt, "Replace:"));
+  static int active_field = 0;
+  
+  if (is_fr_prompt) {
+    active_field = 0;
+  }
+
+  size_t bufsize = 256;
   char *buf = malloc(bufsize);
   if (!buf) die("malloc failed in editorPrompt");
-  size_t buflen = 0;
-  buf[0] = '\0';
+
+  if (is_fr_prompt) {
+    strncpy(buf, find_buffer, bufsize - 1);
+  } else {
+    buf[0] = '\0';
+  }
+  size_t buflen = strlen(buf);
+
   while (1) {
-    editorSetStatusMessage(prompt, buf);
-    editorRefreshScreen();
-    int c = editorReadKey();
-    if (c == DEL_KEY || c == CTRL_KEY('h') || c == BACKSPACE) {
-      if (buflen > 0) {
-        int i = buflen - 1;
-        while (i > 0 && (buf[i] & 0xC0) == 0x80) {
-          i--;
-        }
-        buflen = i;
-        buf[buflen] = '\0';
-      }
-      if (callback) callback(buf, c);
-    } else if (c == '\x1b') {
-      editorSetStatusMessage("");
-      if (callback) callback(buf, c);
-      free(buf);
-      return NULL;
-    } else if (c == '\r') {
-      if (callback) {
-        callback(buf, c);
+    if (is_fr_prompt) {
+      if (active_field == 0) {
+        editorSetStatusMessage("Find: %s [Replace: %s]", buf, replace_buffer);
       } else {
-        if (buflen != 0) {
-          editorSetStatusMessage("");
-          return buf;
-        }
+        editorSetStatusMessage("[Find: %s] Replace: %s", find_buffer, buf);
       }
     } else {
-      char utf8_c[5];
-      int char_len = 0;
-      if (c < 0x80) { // ASCII
-        utf8_c[char_len++] = c;
-      } else if (c < 0x800) {
-        utf8_c[char_len++] = (c >> 6) | 0xC0;
-        utf8_c[char_len++] = (c & 0x3F) | 0x80;
-      } else if (c < 0x10000) {
-        utf8_c[char_len++] = (c >> 12) | 0xE0;
-        utf8_c[char_len++] = ((c >> 6) & 0x3F) | 0x80;
-        utf8_c[char_len++] = (c & 0x3F) | 0x80;
-      } else if (c < 0x110000) {
-        utf8_c[char_len++] = (c >> 18) | 0xF0;
-        utf8_c[char_len++] = ((c >> 12) & 0x3F) | 0x80;
-        utf8_c[char_len++] = ((c >> 6) & 0x3F) | 0x80;
-        utf8_c[char_len++] = (c & 0x3F) | 0x80;
-      }
-      utf8_c[char_len] = '\0';
+      editorSetStatusMessage(prompt, buf);
+    }
+    editorRefreshScreen();
+    
+    int c = editorReadKey();
 
-      if (buflen + char_len >= bufsize) {
-        bufsize *= 2;
-        void *temp = realloc(buf, bufsize);
-        if (!temp) die("realloc failed in editorPrompt");
-        buf = temp;
+    if (c == '\t' && is_fr_prompt) {
+      if (active_field == 0) { // from find to replace
+        strncpy(find_buffer, buf, sizeof(find_buffer) - 1);
+        find_buffer[sizeof(find_buffer) - 1] = '\0';
+        strncpy(buf, replace_buffer, bufsize - 1);
+      } else { // from replace to find
+        strncpy(replace_buffer, buf, sizeof(replace_buffer) - 1);
+        replace_buffer[sizeof(replace_buffer) - 1] = '\0';
+        strncpy(buf, find_buffer, bufsize - 1);
       }
-      memcpy(&buf[buflen], utf8_c, char_len);
-      buflen += char_len;
-      buf[buflen] = '\0';
-      if (callback) callback(buf, c);
+      buflen = strlen(buf);
+      active_field = 1 - active_field;
+      if (callback) callback(c, active_field);
+      continue;
+    }
+
+    switch (c) {
+      case '\r': // Enter
+        if (is_fr_prompt) {
+          if (active_field == 0) {
+            strncpy(find_buffer, buf, sizeof(find_buffer) - 1);
+            find_buffer[sizeof(find_buffer) - 1] = '\0';
+          } else {
+            strncpy(replace_buffer, buf, sizeof(replace_buffer) - 1);
+            replace_buffer[sizeof(replace_buffer) - 1] = '\0';
+          }
+          if (active_field == 0 && strlen(replace_buffer) == 0) {
+            editorSetStatusMessage("");
+            if (callback) callback(c, active_field);
+            free(buf);
+            return NULL;
+          }
+        }
+        if (callback) callback(c, active_field);
+        
+        if (!is_fr_prompt) {
+           editorSetStatusMessage("");
+           return buf;
+        }
+        break;
+
+      case '\x1b': // ESC
+        editorSetStatusMessage("");
+        if (callback) callback(c, active_field);
+        free(buf);
+        return NULL;
+
+      case BACKSPACE:
+      case CTRL_KEY('h'):
+      case DEL_KEY:
+        if (buflen > 0) {
+          int i = buflen - 1;
+          while (i > 0 && (buf[i] & 0xC0) == 0x80) i--;
+          buflen = i;
+          buf[buflen] = '\0';
+        }
+        if (callback) callback(c, active_field);
+        break;
+
+      case ARROW_UP:
+      case ARROW_DOWN:
+      case ARROW_LEFT:
+      case ARROW_RIGHT:
+      case PAGE_UP:
+      case PAGE_DOWN:
+      case HOME_KEY:
+      case END_KEY:
+        if (callback) callback(c, active_field);
+        break;
+
+      default:
+        if (buflen < bufsize - 5) { 
+          if (c < 0x80) {
+            buf[buflen++] = c;
+          } else if (c < 0x800) {
+            buf[buflen++] = (c >> 6) | 0xC0;
+            buf[buflen++] = (c & 0x3F) | 0x80;
+          } else if (c < 0x10000) {
+            buf[buflen++] = (c >> 12) | 0xE0;
+            buf[buflen++] = ((c >> 6) & 0x3F) | 0x80;
+            buf[buflen++] = (c & 0x3F) | 0x80;
+          } else if (c < 0x110000) {
+            buf[buflen++] = (c >> 18) | 0xF0;
+            buf[buflen++] = ((c >> 12) & 0x3F) | 0x80;
+            buf[buflen++] = ((c >> 6) & 0x3F) | 0x80;
+            buf[buflen++] = (c & 0x3F) | 0x80;
+          }
+          buf[buflen] = '\0';
+          if (callback) callback(c, active_field);
+        }
+        break;
     }
   }
 }
@@ -2192,8 +2398,8 @@ void display_help() {
   printf("Aya version %s\n", AYA_VERSION);
   printf("使用法: aya [options] [file]\n");
   printf("オプション:\n");
-  printf("  --help     このヘルプメッセージの表示\n");
-  printf("  --version  バージョン情報の表示\n");
+  printf("  -h, --help     このヘルプメッセージの表示\n");
+  printf("  -v, --version  バージョン情報の表示\n\n");
   printf("  -l <line>  指定行でファイルを開く\n");
 }
 
@@ -2204,10 +2410,10 @@ int main(int argc, char *argv[]) {
   int initial_line = 0;
 
   for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--help") == 0) {
+    if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0 ) {
       display_help();
       return 0;
-    } else if (strcmp(argv[i], "--version") == 0) {
+    } else if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
       display_version();
       return 0;
     } else if (strcmp(argv[i], "-l") == 0) {
