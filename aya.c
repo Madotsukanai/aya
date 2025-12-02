@@ -18,7 +18,7 @@
 #include <wchar.h>
 
 
-#define AYA_VERSION "0.0.6"
+#define AYA_VERSION "0.0.8"
 #define AYA_TAB_STOP 8
 #define AYA_QUIT_TIMES 3
 
@@ -170,6 +170,7 @@ typedef struct erow {
   char *render;
   unsigned char *hl;
   int hl_open_comment;
+  int *render_to_chars_map;
 } erow;
 
 struct editorConfig {
@@ -975,35 +976,72 @@ void editorUpdateRow(erow *row) {
   }
   free(row->render);
   row->render = malloc(row->size + tabs * (AYA_TAB_STOP - 1) + 1);
-  if (!row->render) die("malloc failed in editorUpdateRow");
+  if (!row->render) die("malloc failed in editorUpdateRow render");
 
-  int idx = 0;
-  int rx = 0;
+  int idx = 0; // index for row->render
+  int rx = 0;  // render column
   wchar_t wc;
-  for (int j = 0; j < row->size; ) {
-    if (row->chars[j] == '\t') {
+
+  // Build row->render and calculate row->rsize
+  // Simultaneously, build render_to_chars_map
+  free(row->render_to_chars_map);
+  // Allocate generously, will realloc later if needed. Max possible size for render is row->size + tabs * (AYA_TAB_STOP - 1)
+  row->render_to_chars_map = malloc(sizeof(int) * (row->size + tabs * (AYA_TAB_STOP - 1) + 1));
+  if (!row->render_to_chars_map) die("malloc failed for map in editorUpdateRow map");
+
+  int chars_byte_idx = 0; // Tracks byte index in row->chars
+  while (chars_byte_idx < row->size) {
+    if (row->chars[chars_byte_idx] == '\t') {
+      // Handle tab expansion in render
+      int render_start_idx = idx;
       row->render[idx++] = ' ';
       rx++;
       while (rx % AYA_TAB_STOP != 0) {
         row->render[idx++] = ' ';
         rx++;
       }
-      j++;
+      // All bytes added to render for this tab map to chars_byte_idx
+      for (int k = render_start_idx; k < idx; k++) {
+        row->render_to_chars_map[k] = chars_byte_idx;
+      }
+      chars_byte_idx++; // Move to next char in row->chars
     } else {
-      int char_len = utf8_char_len_from_byte(row->chars[j]);
+      // Handle regular character
+      int char_len_in_chars = utf8_char_len_from_byte(row->chars[chars_byte_idx]);
+      
       int width = 1;
-      if (mbtowc(&wc, &row->chars[j], char_len) > 0) {
+      if (mbtowc(&wc, &row->chars[chars_byte_idx], char_len_in_chars) > 0) {
           width = wcwidth(wc);
           if (width < 0) width = 1;
       }
       rx += width;
-      memcpy(&row->render[idx], &row->chars[j], char_len);
-      idx += char_len;
-      j += char_len;
+
+      memcpy(&row->render[idx], &row->chars[chars_byte_idx], char_len_in_chars);
+      // All bytes copied to render for this character map to chars_byte_idx
+      for (int k = 0; k < char_len_in_chars; k++) {
+        row->render_to_chars_map[idx + k] = chars_byte_idx;
+      }
+      idx += char_len_in_chars; // Move idx (render offset)
+      chars_byte_idx += char_len_in_chars; // Move chars_byte_idx (chars offset)
     }
   }
   row->render[idx] = '\0';
-  row->rsize = idx;
+  row->rsize = idx; // Final determined size of render string
+
+  // Handle the null terminator of render string in the map
+  if (row->rsize > 0) {
+      row->render_to_chars_map[row->rsize] = row->render_to_chars_map[row->rsize - 1];
+  } else {
+      row->render_to_chars_map[0] = 0; // For empty rows
+  }
+
+  // Reallocate render_to_chars_map to exact size to save memory
+  void *temp_map = realloc(row->render_to_chars_map, sizeof(int) * (row->rsize + 1));
+  if (temp_map == NULL) {
+      die("realloc failed for map shrinking in editorUpdateRow");
+  }
+  row->render_to_chars_map = temp_map;
+
   editorUpdateSyntax(row);
 }
 
@@ -1026,6 +1064,7 @@ void editorInsertRow(int at, char *s, size_t len) {
   E.row[at].render = NULL;
   E.row[at].hl = NULL;
   E.row[at].hl_open_comment = 0;
+  E.row[at].render_to_chars_map = NULL;
   editorUpdateRow(&E.row[at]);
   E.numrows++;
 
@@ -1040,6 +1079,8 @@ void editorFreeRow(erow *row) {
   row->chars = NULL;
   free(row->hl);
   row->hl = NULL;
+  free(row->render_to_chars_map);
+  row->render_to_chars_map = NULL;
 }
 
 void editorDelRow(int at) {
@@ -1324,9 +1365,11 @@ void editorDelChar() {
       action.type = ACTION_DELETE_STRING;
       action.cy = E.cy;
       action.cx = E.cx - char_len;
-      action.data.string.str = &row->chars[E.cx - char_len];
+      action.data.string.str = strndup(&row->chars[E.cx - char_len], char_len);
+      if (!action.data.string.str) die("strndup failed in editorDelChar");
       action.data.string.len = char_len;
       push_undo_action(action);
+      free(action.data.string.str);
     }
     editorRowDelChar(row, E.cx - char_len, char_len);
     E.cx -= char_len;
@@ -1522,7 +1565,6 @@ void editorFindCallback(char *query, int key) {
             last_match_cx = match - row->render;
             E.cy = current_cy;
             E.cx = editorRowRxToCx(row, last_match_cx);
-            E.rowoff = E.numrows;
             return;
         }
     }
@@ -1535,22 +1577,48 @@ void editorScroll() {
   if (E.cy < E.numrows) {
     E.rx = editorRowCxToRx(&E.row[E.cy], E.cx);
   }
+
   if (E.cy < E.rowoff) {
     E.rowoff = E.cy;
   }
   if (E.cy >= E.rowoff + E.screenrows) {
     E.rowoff = E.cy - E.screenrows + 1;
   }
+
+  int line_num_width = 0;
+  if (E.syntax) {
+      int temp = E.numrows;
+      while (temp > 0) {
+          temp /= 10;
+          line_num_width++;
+      }
+      if (line_num_width == 0) line_num_width = 1;
+      line_num_width += 1; // for space
+  }
+
+  int effective_screencols = E.screencols - line_num_width;
+
   if (E.rx < E.coloff) {
     E.coloff = E.rx;
   }
-  if (E.rx >= E.coloff + E.screencols) {
-    E.coloff = E.rx - E.screencols + 1;
+  if (E.rx >= E.coloff + effective_screencols) {
+    E.coloff = E.rx - effective_screencols + 1;
   }
 }
 
 void editorDrawRows(struct abuf *ab) {
   int y;
+  int line_num_width = 0;
+  if (E.syntax) {
+    int temp = E.numrows;
+    while (temp > 0) {
+      temp /= 10;
+      line_num_width++;
+    }
+    if (line_num_width == 0) line_num_width = 1;
+    line_num_width += 1; // for space
+  }
+
   for (y = 0; y < E.screenrows; y++) {
     int filerow = y + E.rowoff;
     if (filerow >= E.numrows) {
@@ -1570,11 +1638,24 @@ void editorDrawRows(struct abuf *ab) {
         abAppend(ab, "~", 1);
       }
     } else {
+      if (E.syntax) {
+        char line_num_str[16];
+        int len = snprintf(line_num_str, sizeof(line_num_str), "%*d ", line_num_width -1, filerow + 1);
+        abAppend(ab, "\x1b[38;5;240m", 11); // Dim gray color
+        abAppend(ab, line_num_str, len);
+        abAppend(ab, "\x1b[39m", 5);
+      }
+
       erow *row = &E.row[filerow];
       int rx = 0;
       int current_color_applied = 39;
       int current_invert_applied = 0;
       
+      int start_col = E.syntax ? E.coloff : E.coloff;
+      if (start_col < 0) start_col = 0;
+      
+      int screen_width = E.syntax ? E.screencols - line_num_width : E.screencols;
+
       for (int j = 0; j < row->rsize; ) {
           int char_len = utf8_char_len_from_byte(row->render[j]);
           int width = 1;
@@ -1583,16 +1664,14 @@ void editorDrawRows(struct abuf *ab) {
               width = wcwidth(wc);
               if (width < 0) width = 1;
           } else {
-              // Invalid UTF-8 sequence, treat as single byte
               char_len = 1;
               width = 1;
           }
 
-          if (rx >= E.coloff) {
-              if (rx >= E.coloff + E.screencols) break;
-
-              // --- Logic from original function, now inside the visibility check ---
-              int is_sel_for_this_char = is_selected(filerow, j);
+          if (rx >= start_col) {
+              if (rx - start_col >= screen_width) break;
+              int chars_idx = (row->render_to_chars_map) ? row->render_to_chars_map[j] : j;
+              int is_sel_for_this_char = is_selected(filerow, chars_idx);
               int color_for_this_char = editorSyntaxToColor(row->hl[j]);
 
               if (is_sel_for_this_char && !current_invert_applied) {
@@ -1621,14 +1700,11 @@ void editorDrawRows(struct abuf *ab) {
               } else {
                 abAppend(ab, &row->render[j], char_len);
               }
-              // --- End of original logic ---
           }
-
           rx += width;
           j += char_len;
       }
       
-      // After the loop, ensure everything is reset to default
       if (current_invert_applied) {
         abAppend(ab, "\x1b[27m", 5);
       }
@@ -1644,46 +1720,24 @@ void editorDrawRows(struct abuf *ab) {
 
 
 void editorDrawStatusBar(struct abuf *ab) {
-    char status[80], rstatus[32];
-
-    // 左側ステータス
-    int status_len = snprintf(status, sizeof(status), "%.20s - %d 行 %s",
-                              E.filename ? E.filename : "[無題]",
-                              E.numrows,
-                              E.dirty ? "(変更済)" : "");
-    if (status_len < 0) status_len = 0;
-    if (status_len > E.screencols) status_len = E.screencols;
-
-    // 右側ステータス
-    int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d", E.cy + 1, E.numrows);
-    if (rlen < 0) rlen = 0;
-    if (rlen > E.screencols) rlen = E.screencols;
-
-    // 左側表示の切り詰め
-    int left_len = status_len;
-    if (left_len + rlen > E.screencols) left_len = E.screencols - rlen;
-    if (left_len < 0) left_len = 0;
-
-    // 行頭クリア
-    abAppend(ab, "\r\x1b[K", 4);
-
-    // 反転表示開始
     abAppend(ab, "\x1b[7m", 4);
-
-    // 左側表示
-    abAppend(ab, status, left_len);
-
-    // 左右間を空白で埋める
-    for (int i = 0; i < E.screencols - left_len - rlen; i++)
-        abAppend(ab, " ", 1);
-
-    // 右側表示
-    abAppend(ab, rstatus, rlen);
-
-    // 反転解除
+    char status[80], rstatus[80];
+    int len = snprintf(status, sizeof(status), "%.20s - %d 行 %s",
+        E.filename ? E.filename : "無題]", E.numrows, E.dirty ? "(変更済)" : "");
+    int rlen = snprintf(rstatus, sizeof(rstatus), "%s | %d/%d",
+        E.syntax ? E.syntax->filetype : "no ft", E.cy + 1, E.numrows);
+    if (len > E.screencols) len = E.screencols;
+    abAppend(ab, status, len);
+    while (len < E.screencols) {
+        if (E.screencols - len == rlen) {
+            abAppend(ab, rstatus, rlen);
+            break;
+        } else {
+            abAppend(ab, " ", 1);
+            len++;
+        }
+    }
     abAppend(ab, "\x1b[m", 3);
-
-    // 改行
     abAppend(ab, "\r\n", 2);
 }
 
@@ -1691,26 +1745,61 @@ void editorDrawStatusBar(struct abuf *ab) {
 void editorDrawMessageBar(struct abuf *ab) {
   abAppend(ab, "\x1b[K", 3);
   int msglen = strlen(E.statusmsg);
-  if (msglen > E.screencols) msglen = E.screencols;
   if (msglen && time(NULL) - E.statusmsg_time < 5) {
     abAppend(ab, "\x1b[7m", 4);
-    abAppend(ab, E.statusmsg, msglen);
+    int display_width = 0;
+    int i = 0;
+    wchar_t wc;
+    while(i < msglen) {
+        int char_bytes = mbtowc(&wc, &E.statusmsg[i], msglen - i);
+        if (char_bytes <= 0) {
+            char_bytes = 1; 
+        }
+
+        int col_width = wcwidth(wc);
+        if (col_width < 0) col_width = 1;
+
+        if (display_width + col_width > E.screencols) {
+            abAppend(ab, "...", 3);
+            break;
+        }
+        
+        abAppend(ab, &E.statusmsg[i], char_bytes);
+        display_width += col_width;
+        i += char_bytes;
+    }
+    abAppend(ab, "\x1b[m", 3);
   }
 }
 
 void editorRefreshScreen() {
   editorScroll();
   struct abuf ab = ABUF_INIT;
+
   abAppend(&ab, "\x1b[?25l", 6);
   abAppend(&ab, "\x1b[H", 3);
+  
   editorDrawStatusBar(&ab);
   editorDrawRows(&ab);
   editorDrawMessageBar(&ab);
+  
+  int line_num_width = 0;
+  if (E.syntax) {
+      int temp = E.numrows;
+      if (temp == 0) temp = 1;
+      while (temp > 0) {
+          temp /= 10;
+          line_num_width++;
+      }
+      line_num_width += 1; // for space
+  }
+
   char buf[32];
-  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 2,
-           (E.rx - E.coloff) + 1);
+  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 2, (E.rx - E.coloff) + 1 + line_num_width);
   abAppend(&ab, buf, strlen(buf));
+  
   abAppend(&ab, "\x1b[?25h", 6);
+  
   write(STDOUT_FILENO, ab.b, ab.len);
   abFree(&ab);
 }
@@ -1736,7 +1825,14 @@ char *editorPrompt(char *prompt, void (*callback)(char *, int)) {
     editorRefreshScreen();
     int c = editorReadKey();
     if (c == DEL_KEY || c == CTRL_KEY('h') || c == BACKSPACE) {
-      if (buflen != 0) buf[--buflen] = '\0';
+      if (buflen > 0) {
+        int i = buflen - 1;
+        while (i > 0 && (buf[i] & 0xC0) == 0x80) {
+          i--;
+        }
+        buflen = i;
+        buf[buflen] = '\0';
+      }
       if (callback) callback(buf, c);
     } else if (c == '\x1b') {
       editorSetStatusMessage("");
@@ -1752,14 +1848,34 @@ char *editorPrompt(char *prompt, void (*callback)(char *, int)) {
           return buf;
         }
       }
-    } else if (!iscntrl(c) && c < 128) {
-      if (buflen == bufsize - 1) {
+    } else {
+      char utf8_c[5];
+      int char_len = 0;
+      if (c < 0x80) { // ASCII
+        utf8_c[char_len++] = c;
+      } else if (c < 0x800) {
+        utf8_c[char_len++] = (c >> 6) | 0xC0;
+        utf8_c[char_len++] = (c & 0x3F) | 0x80;
+      } else if (c < 0x10000) {
+        utf8_c[char_len++] = (c >> 12) | 0xE0;
+        utf8_c[char_len++] = ((c >> 6) & 0x3F) | 0x80;
+        utf8_c[char_len++] = (c & 0x3F) | 0x80;
+      } else if (c < 0x110000) {
+        utf8_c[char_len++] = (c >> 18) | 0xF0;
+        utf8_c[char_len++] = ((c >> 12) & 0x3F) | 0x80;
+        utf8_c[char_len++] = ((c >> 6) & 0x3F) | 0x80;
+        utf8_c[char_len++] = (c & 0x3F) | 0x80;
+      }
+      utf8_c[char_len] = '\0';
+
+      if (buflen + char_len >= bufsize) {
         bufsize *= 2;
         void *temp = realloc(buf, bufsize);
         if (!temp) die("realloc failed in editorPrompt");
         buf = temp;
       }
-      buf[buflen++] = c;
+      memcpy(&buf[buflen], utf8_c, char_len);
+      buflen += char_len;
       buf[buflen] = '\0';
       if (callback) callback(buf, c);
     }
