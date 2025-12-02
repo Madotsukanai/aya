@@ -40,7 +40,10 @@ enum editorKey {
   SHIFT_ARROW_LEFT,
   SHIFT_ARROW_RIGHT,
   SHIFT_ARROW_UP,
-  SHIFT_ARROW_DOWN
+  SHIFT_ARROW_DOWN,
+  CTRL_ARROW_RIGHT,
+  CTRL_ARROW_LEFT,
+  THORN_KEY = 1016
 };
 
 enum editorLight {
@@ -264,6 +267,7 @@ void disableRawMode() {
     die("tcsetattr");
   write(STDOUT_FILENO, "\x1b[?1006l", 8); // Disable SGR mouse mode
   write(STDOUT_FILENO, "\x1b[?1000l", 8); // Disable normal mouse reporting
+  write(STDOUT_FILENO, "\x1b[?1049l", 6); // Exit alternate screen buffer
 }
 
 void enableRawMode() {
@@ -279,6 +283,7 @@ void enableRawMode() {
   if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) die("tcsetattr");
   write(STDOUT_FILENO, "\x1b[?1000h", 8); // Enable normal mouse reporting
   write(STDOUT_FILENO, "\x1b[?1006h", 8); // Enable SGR mouse mode
+  write(STDOUT_FILENO, "\x1b[?1049h", 6); // Enter alternate screen buffer
 }
 
 int editorReadKey() {
@@ -299,7 +304,9 @@ int editorReadKey() {
       }
       i++;
     }
-    if (i == 0) return '\x1b';
+    if (i == 0) { // If only ESC was read
+        return '\x1b';
+    }
     seq[i] = '\0';
 
     if (seq[0] == '[') {
@@ -332,17 +339,11 @@ int editorReadKey() {
               case 'C': return SHIFT_ARROW_RIGHT;
               case 'D': return SHIFT_ARROW_LEFT;
           }
-      } else if (seq[1] == '<') {
-          int b, x, y;
-          char m;
-          if (sscanf(seq, "[<%d;%d;%d%c", &b, &x, &y, &m) == 4) {
-              if (m == 'M') {
-                  if (b == 64) return MOUSE_WHEEL_UP;
-                  if (b == 65) return MOUSE_WHEEL_DOWN;
-                  E.cx = x - 1;
-                  E.cy = y - 1;
-                  return MOUSE_CLICK;
-              }
+      }
+      else if (strncmp(seq, "[1;5", 4) == 0 && strlen(seq) == 5) {
+          switch(seq[4]) {
+              case 'C': return CTRL_ARROW_RIGHT;
+              case 'D': return CTRL_ARROW_LEFT;
           }
       }
     } else if (seq[0] == 'O') {
@@ -1687,7 +1688,7 @@ void editorFind() {
   int saved_coloff = E.coloff;
   int saved_rowoff = E.rowoff;
 
-  char *query = editorPrompt("Find: %s | Replace: %s", (void(*)(int,int))editorFindCallback);
+  char *query = editorPrompt("検索: %s | 置換: %s", (void(*)(int,int))editorFindCallback);
 
   if (query == NULL) { // Search was cancelled
     E.cx = saved_cx;
@@ -1918,11 +1919,12 @@ void editorDrawMessageBar(struct abuf *ab) {
 }
 
 void editorRefreshScreen() {
+  write(STDOUT_FILENO, "\x1b[2J", 4);
+  write(STDOUT_FILENO, "\x1b[H", 3);
   editorScroll();
   struct abuf ab = ABUF_INIT;
 
   abAppend(&ab, "\x1b[?25l", 6);
-  abAppend(&ab, "\x1b[H", 3);
   
   editorDrawStatusBar(&ab);
   editorDrawRows(&ab);
@@ -1960,7 +1962,7 @@ void editorSetStatusMessage(const char *fmt, ...) {
 /*** input ***/
 
 char *editorPrompt(char *prompt, void (*callback)(int, int)) {
-  int is_fr_prompt = (strstr(prompt, "Find:") && strstr(prompt, "Replace:"));
+  int is_fr_prompt = (strstr(prompt, "検索:") && strstr(prompt, "置換:"));
   static int active_field = 0;
   
   if (is_fr_prompt) {
@@ -1981,9 +1983,9 @@ char *editorPrompt(char *prompt, void (*callback)(int, int)) {
   while (1) {
     if (is_fr_prompt) {
       if (active_field == 0) {
-        editorSetStatusMessage("Find: %s [Replace: %s]", buf, replace_buffer);
+        editorSetStatusMessage("[検索: %s] 置換: %s", buf, replace_buffer);
       } else {
-        editorSetStatusMessage("[Find: %s] Replace: %s", find_buffer, buf);
+        editorSetStatusMessage("検索: %s [置換: %s]", find_buffer, buf);
       }
     } else {
       editorSetStatusMessage(prompt, buf);
@@ -2135,6 +2137,11 @@ void editorMoveCursor(int key) {
         E.cx = 0;
       }
       break;
+    case CTRL_ARROW_RIGHT:
+      if (E.cy < E.numrows) {
+        E.cx = E.row[E.cy].size;
+      }
+      break;
     case ARROW_UP:
       if (E.cy != 0) {
         E.cy--;
@@ -2222,9 +2229,11 @@ void editorProcessKeypress() {
       editorUndo();
       break;
     case HOME_KEY:
+    case CTRL_ARROW_LEFT: // Handle Ctrl + Left Arrow
       E.cx = 0;
       break;
     case END_KEY:
+    case THORN_KEY: // Handle Ctrl + Right Arrow as THORN_KEY
       if (E.cy < E.numrows)
         E.cx = E.row[E.cy].size;
       break;
