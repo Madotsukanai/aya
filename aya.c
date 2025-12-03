@@ -1373,50 +1373,151 @@ void editorInsertNewLine() {
         editorDeleteSelection();
     }
 
-    // Undo 用の情報
-    if (!E.is_undo_redo) {
-        undoAction action;
-        action.type = ACTION_SPLIT_LINE;
-        action.cx = E.cx;
-        action.cy = E.cy;
+    if (E.cx == 0 && E.cy < E.numrows) {
+        char indent_str[256] = {0};
+        int indent_len = 0;
+        erow *next_row = &E.row[E.cy];
+        while (indent_len < next_row->size &&
+               isspace(next_row->chars[indent_len]) &&
+               indent_len < (int)sizeof(indent_str) - 1) {
+            indent_str[indent_len] = next_row->chars[indent_len];
+            indent_len++;
+        }
+        indent_str[indent_len] = '\0';
 
-        if (E.cy < E.numrows) {
-            erow *row = &E.row[E.cy];
-            if (E.cx <= row->size) {
-                action.data.string.str = strdup(&row->chars[E.cx]);
-                if (!action.data.string.str) die("strdup failed in editorInsertNewLine");
-                action.data.string.len = row->size - E.cx;
+        if (!E.is_undo_redo) {
+            undoAction action;
+            action.type = ACTION_SPLIT_LINE;
+            action.cx = 0;
+            action.cy = E.cy > 0 ? E.cy -1 : 0;
+            if (E.cy > 0) {
+              erow *prev_row = &E.row[E.cy - 1];
+              action.cx = prev_row->size;
+              action.data.string.str = "";
+              action.data.string.len = 0;
+
             } else {
-                action.data.string.str = strdup("");
-                if (!action.data.string.str) die("strdup failed in editorInsertNewLine");
-                action.data.string.len = 0;
+               action.data.string.str = "";
+               action.data.string.len = 0;
             }
-        } else {
-            action.data.string.str = strdup("");
-            if (!action.data.string.str) die("strdup failed in editorInsertNewLine");
-            action.data.string.len = 0;
+             push_undo_action(action);
         }
 
-        push_undo_action(action);
-        free(action.data.string.str);
-    }
 
-    // 新しい行の挿入
-    if (E.cy == E.numrows) {
-        editorInsertRow(E.numrows, "", 0); // ファイル末尾に行を追加
-    } else if (E.cx == 0) {
-        editorInsertRow(E.cy, "", 0);
+        editorInsertRow(E.cy, indent_str, indent_len);
+        E.cx = indent_len;
+
     } else {
-        erow *row = &E.row[E.cy];
-        editorInsertRow(E.cy + 1, &row->chars[E.cx], row->size - E.cx);
-        row = &E.row[E.cy];
-        row->size = E.cx;
-        row->chars[row->size] = '\0';
-        editorUpdateRow(row);
-    }
+        char indent_str[256] = {0};
+        int indent_len = 0;
+        if (E.cy < E.numrows) {
+            erow *current_row = &E.row[E.cy];
+            while (indent_len < current_row->size &&
+                   (current_row->chars[indent_len] == ' ' || current_row->chars[indent_len] == '\t') &&
+                   indent_len < (int)sizeof(indent_str) - 1) {
+                indent_str[indent_len] = current_row->chars[indent_len];
+                indent_len++;
+            }
+            indent_str[indent_len] = '\0';
+        }
 
-    E.cy++;
-    E.cx = 0;
+        if (E.syntax && (strcmp(E.syntax->filetype, "python") == 0 || strcmp(E.syntax->filetype, "c") == 0 || strcmp(E.syntax->filetype, "cpp") == 0)) {
+            if (E.cy < E.numrows) {
+                erow *current_row = &E.row[E.cy];
+                int i = E.cx - 1;
+                while (i >= 0 && isspace(current_row->chars[i])) {
+                    i--;
+                }
+                char trigger_char = 0;
+                if (strcmp(E.syntax->filetype, "python") == 0) {
+                    trigger_char = ':';
+                } else {
+                    trigger_char = '{';
+                }
+
+                if (i >= 0 && current_row->chars[i] == trigger_char) {
+                    bool use_tabs = true;
+                    if (indent_len > 0) {
+                        bool has_tabs = false;
+                        for (int k = 0; k < indent_len; k++) {
+                            if (indent_str[k] == '\t') {
+                                has_tabs = true;
+                                break;
+                            }
+                        }
+                        if (!has_tabs) {
+                            use_tabs = false;
+                        }
+                    }
+
+                    if (use_tabs) {
+                        if (indent_len + 1 < (int)sizeof(indent_str)) {
+                            indent_str[indent_len++] = '\t';
+                            indent_str[indent_len] = '\0';
+                        }
+                    } else {
+                        int spaces_to_add = 2;
+                        if (indent_len + spaces_to_add < (int)sizeof(indent_str)) {
+                            for (int k = 0; k < spaces_to_add; k++) {
+                                indent_str[indent_len++] = ' ';
+                            }
+                            indent_str[indent_len] = '\0';
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!E.is_undo_redo) {
+            undoAction action;
+            action.type = ACTION_SPLIT_LINE;
+            action.cx = E.cx;
+            action.cy = E.cy;
+
+            if (E.cy < E.numrows) {
+                erow *row = &E.row[E.cy];
+                if (E.cx <= row->size) {
+                    action.data.string.str = &row->chars[E.cx];
+                    action.data.string.len = row->size - E.cx;
+                } else {
+                    action.data.string.str = "";
+                    action.data.string.len = 0;
+                }
+            } else {
+                action.data.string.str = "";
+                action.data.string.len = 0;
+            }
+            push_undo_action(action);
+        }
+
+        if (E.cy == E.numrows) {
+            editorInsertRow(E.numrows, "", 0);
+        } else {
+            erow *row = &E.row[E.cy];
+            editorInsertRow(E.cy + 1, &row->chars[E.cx], row->size - E.cx);
+            row = &E.row[E.cy];
+            row->size = E.cx;
+            row->chars[row->size] = '\0';
+            editorUpdateRow(row);
+        }
+        E.cy++;
+        E.cx = 0;
+
+        if (indent_len > 0) {
+            editorRowInsertString(&E.row[E.cy], 0, indent_str, indent_len);
+            E.cx = indent_len;
+
+            if (!E.is_undo_redo) {
+                undoAction action;
+                action.type = ACTION_INSERT_STRING;
+                action.cx = 0;
+                action.cy = E.cy;
+                action.data.string.str = indent_str;
+                action.data.string.len = indent_len;
+                push_undo_action(action);
+            }
+        }
+    }
 }
 
 void editorDelChar() {
@@ -1916,8 +2017,8 @@ void editorRefreshScreen() {
   
   struct abuf current_frame_ab = ABUF_INIT;
 
-  abAppend(&current_frame_ab, "\x1b[?25l", 6); // Hide cursor
-  abAppend(&current_frame_ab, "\x1b[H", 3);    // Cursor to top-left
+  abAppend(&current_frame_ab, "\x1b[?25l", 6);
+  abAppend(&current_frame_ab, "\x1b[H", 3);
 
   editorDrawStatusBar(&current_frame_ab);
   editorDrawRows(&current_frame_ab);
@@ -1938,10 +2039,10 @@ void editorRefreshScreen() {
   snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 2, (E.rx - E.coloff) + 1 + line_num_width);
   abAppend(&current_frame_ab, buf, (size_t)strlen(buf));
   
-  abAppend(&current_frame_ab, "\x1b[?25h", 6); // Show cursor
+  abAppend(&current_frame_ab, "\x1b[?25h", 6);
   
   editorUpdateScreenContent(&current_frame_ab, &E.prev_screen_abuf);
-  // current_frame_ab's buffer is now owned by E.prev_screen_abuf, so don't free it.
+
   current_frame_ab.b = NULL;
   current_frame_ab.len = 0;
   abFree(&current_frame_ab);
