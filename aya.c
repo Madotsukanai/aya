@@ -16,6 +16,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <wchar.h>
+#include <stdbool.h>
 
 #define AYA_VERSION "0.1.0"
 #define AYA_TAB_STOP 8
@@ -89,7 +90,7 @@ char *C_HL_keywords[] = {
 char *cpp_HL_extensions[] = { ".cpp", ".hpp", ".cc", ".hh", NULL };
 char *cpp_HL_keywords[] = {
     "switch", "if", "while", "for", "break", "continue", "return", "else",
-    "struct", "union", "typedef", "static", "enum", "case", "const", 
+    "struct", "union", "typedef", "static", "enum", "case", "const",
     "volatile", "extern", "register", "sizeof", "goto", "do", "default",
     "class", "public", "private", "protected", "template", "typename",
     "try", "catch", "throw", "new", "delete", "this", "friend", "virtual",
@@ -100,6 +101,18 @@ char *cpp_HL_keywords[] = {
     "int|", "long|", "double|", "float|", "char|", "unsigned|", "signed|",
     "void|", "short|", "bool|", "auto|", "decltype|",
     "true|", "false|", "nullptr|", NULL
+};
+
+char *makefile_HL_extensions[] = { "makefile", "Makefile", NULL };
+char *makefile_HL_keywords[] = {
+    "define", "endef", "ifeq", "ifneq", "ifdef", "ifndef", "else", "endif",
+    "include", "sinclude", "override", "export", "unexport", "vpath",
+
+    ".PHONY|", ".DEFAULT|", ".PRECIOUS|", ".INTERMEDIATE|", ".SECONDARY|",
+    ".DELETE_ON_ERROR|", ".LOW_RESOLUTION_TIME|", ".SILENT|", ".IGNORE|",
+    ".NOTPARALLEL|", ".ONESHELL|",
+    
+    ":=|", "+=|", "?=|", "$@|", "$<|", "$^|", "$?|", "$*|", "$+|", NULL
 };
 
 char *python_HL_extensions[] = { ".py", NULL };
@@ -131,6 +144,13 @@ struct editorSyntax HLDB[] = {
     HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS
   },
   {
+    "makefile",
+    makefile_HL_extensions,
+    makefile_HL_keywords,
+    "#", NULL, NULL,
+    HL_HIGHLIGHT_STRINGS
+  },
+  {
     "python",
     python_HL_extensions,
     python_HL_keywords,
@@ -138,7 +158,6 @@ struct editorSyntax HLDB[] = {
     HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS
   },
 };
-
 #define HLDB_ENTRIES (sizeof(HLDB) / sizeof(HLDB[0]))
 
 /*** undo/redo ***/
@@ -161,6 +180,15 @@ typedef struct {
     } string;
   } data;
 } undoAction;
+
+/*** append buffer ***/
+
+struct abuf {
+  char *b;
+  size_t len;
+};
+
+#define ABUF_INIT {NULL, 0}
 
 /*** data ***/
 
@@ -202,6 +230,7 @@ struct editorConfig {
   int redo_capacity;
   int is_undo_redo;
   int initial_line;
+  struct abuf prev_screen_abuf;
 };
 
 struct editorConfig E;
@@ -436,7 +465,38 @@ void editorUpdateSyntax(erow *row) {
     }
       row->hl = realloc(row->hl, row->rsize);
       if (!row->hl) die("realloc failed in editorDrawRows");
-      memset(row->hl, HL_NORMAL, row->rsize);    if (E.syntax == NULL) return;
+      memset(row->hl, HL_NORMAL, row->rsize);
+    if (E.syntax == NULL) return;
+
+    // Makefile specific highlighting
+    if (strcmp(E.syntax->filetype, "makefile") == 0) {
+        // Highlight commands (lines starting with a tab)
+        if (row->size > 0 && row->chars[0] == '\t') {
+            memset(row->hl, HL_MLCOMMENT, row->rsize);
+        }
+
+        // Highlight targets (e.g., `target:`)
+        char *colon = strchr(row->render, ':');
+        char *equal = strpbrk(row->render, "=?");
+        if (colon && (!equal || colon < equal)) {
+            memset(row->hl, HL_KEYWORD1, colon - row->render);
+        }
+
+        // Highlight variable expansions like $(VAR)
+        for (int i = 0; i < row->rsize - 1; i++) {
+            if (row->render[i] == '$' && row->render[i+1] == '(') {
+                int j = i + 2;
+                while (j < row->rsize && row->render[j] != ')') {
+                    j++;
+                }
+                if (j < row->rsize) { // Found closing paren
+                    memset(&row->hl[i], HL_PREPROC, j - i + 1);
+                }
+                i = j;
+            }
+        }
+    }
+
     char **keywords = E.syntax->keywords;
     char *scs = E.syntax->singleline_comment_start;
     char *mcs = E.syntax->multiline_comment_start;
@@ -640,7 +700,7 @@ int editorSyntaxToColor(int hl) {
   switch (hl) {
     case HL_PREPROC: return 35;
     case HL_COMMENT:
-    case HL_MLCOMMENT: return 36;
+    case HL_MLCOMMENT: return 92;
     case HL_KEYWORD1: return 34;
     case HL_KEYWORD2: return 36;
     case HL_STRING: return 33;
@@ -653,14 +713,7 @@ int editorSyntaxToColor(int hl) {
   }
 }
 
-/*** append buffer ***/
 
-struct abuf {
-  char *b;
-  size_t len;
-};
-
-#define ABUF_INIT {NULL, 0}
 
 void abAppend(struct abuf *ab, const char *s, size_t len) {
     char *new_b = realloc(ab->b, ab->len + len);
@@ -1169,10 +1222,20 @@ char *editorGetSelectedString() {
   }
 
   // ここで strdup して返す
-  char *ret = strdup(ab.b ? ab.b : "");
-  if (!ret) die("strdup failed in editorGetSelectedString");
-  abFree(&ab); // ab の内部バッファを解放
-  return ret;
+  // Ensure ab.b is null-terminated before strdup.
+  // Handle empty buffer case separately.
+  if (ab.b == NULL) {
+      char *ret = strdup("");
+      if (!ret) die("strdup failed in editorGetSelectedString");
+      abFree(&ab); // Free the empty abuf struct, though it's technically already empty.
+      return ret;
+  } else {
+      abAppend(&ab, "", 1); // Append a null terminator
+      char *ret = strdup(ab.b);
+      if (!ret) die("strdup failed in editorGetSelectedString");
+      abFree(&ab);
+      return ret;
+  }
 }
 
 void editorDeleteSelection() {
@@ -1430,6 +1493,9 @@ void editorOpen(char *filename) {
   free(E.filename);
   E.filename = strdup(filename);
   if (!E.filename) die("strdup failed in editorOpen");
+
+  editorSelectSyntaxHighlight();
+
   FILE *fp = fopen(filename, "r");
   if (!fp) {
     if (errno != ENOENT) {
@@ -1448,7 +1514,6 @@ void editorOpen(char *filename) {
   free(line);
   fclose(fp);
   E.dirty = 0;
-  editorSelectSyntaxHighlight();
 
   if (E.initial_line > 0) {
     E.cy = E.initial_line - 1;
@@ -1519,167 +1584,92 @@ void editorReplace() {
 }
 
 void editorFindCallback(int key, int active_field) {
-
     static int last_match_cy = -1;
-
-    static int last_match_cx = -1; 
-
+    static int last_match_cx = -1;
     static int direction = 1;
+    static char prev_find_buffer[256] = "";
+    static char prev_replace_buffer[256] = "";
 
-
+    // Reset if search/replace strings have changed
+    if (strcmp(find_buffer, prev_find_buffer) != 0 || strcmp(replace_buffer, prev_replace_buffer) != 0) {
+        last_match_cy = -1;
+        last_match_cx = -1;
+        direction = 1;
+        strncpy(prev_find_buffer, find_buffer, sizeof(prev_find_buffer) - 1);
+        strncpy(prev_replace_buffer, replace_buffer, sizeof(prev_replace_buffer) - 1);
+    }
 
     if (key == '\t' || key == '\x1b') {
-
         last_match_cy = -1;
-
         last_match_cx = -1;
-
         direction = 1;
-
         return;
-
-    }
-
-    
-
-    if (key == '\r') {
-
-        if (active_field == 1) { 
-
+    } else if (key == '\r') {
+        if (active_field == 1) { // In replace field
             editorReplace();
-
-        } else {
-
-             if (strlen(replace_buffer) == 0) {
-
-                 return; 
-
-             }
-
+            direction = 1; // Always find next after replacing
+        } else { // In find field
+            if (last_match_cy == -1) { // This is the first search action
+                direction = 1; 
+            } else { // Already on a match, so just exit
+                return;
+            }
         }
-
-        direction = 1; 
-
     } else if (key == ARROW_DOWN || key == ARROW_RIGHT) {
-
         direction = 1;
-
     } else if (key == ARROW_UP || key == ARROW_LEFT) {
-
         direction = -1;
-
-    } else { 
-
-        last_match_cy = -1;
-
-        last_match_cx = -1;
-
-        direction = 1;
-
     }
-
-    
 
     if (strlen(find_buffer) == 0) return;
 
-    
-
     if (last_match_cy == -1) {
-
-      direction = 1;
-
-      last_match_cy = 0;
-
-      last_match_cx = -1;
-
+        last_match_cy = E.cy;
+        last_match_cx = E.cx;
     }
-
-
 
     int start_row = last_match_cy;
-
     for (int i = 0; i < E.numrows; i++) {
-
-        int row_idx = start_row;
-
+        int current_row_idx;
         if (direction == 1) {
-
-            row_idx = (start_row + i) % E.numrows;
-
+            current_row_idx = (start_row + i) % E.numrows;
         } else {
-
-            row_idx = (start_row - i + E.numrows) % E.numrows;
-
+            current_row_idx = (start_row - i + E.numrows) % E.numrows;
         }
 
-
-
-        erow *row = &E.row[row_idx];
-
+        erow *row = &E.row[current_row_idx];
         char *match = NULL;
 
-        
-
         if (direction == 1) {
-
-            int start_cx = (row_idx == last_match_cy) ? last_match_cx + 1 : 0;
-
-            if (start_cx <= row->size) {
-
-                 match = strstr(row->chars + start_cx, find_buffer);
-
+            int start_char_idx = (current_row_idx == last_match_cy && i==0) ? last_match_cx + 1 : 0;
+            if (start_char_idx <= row->size) {
+                 match = strstr(&row->chars[start_char_idx], find_buffer);
             }
-
         } else { // Backward search
-
-            int start_cx = (row_idx == last_match_cy) ? last_match_cx : row->size;
-
-            char *p = row->chars;
-
-            char *last_match_ptr = NULL;
-
-            while(p < row->chars + start_cx) {
-
-                char *m = strstr(p, find_buffer);
-
-                if (m && m < row->chars + start_cx) {
-
-                    last_match_ptr = m;
-
-                    p = m + 1;
-
+            int start_char_idx = (current_row_idx == last_match_cy && i==0) ? last_match_cx : row->size;
+            char *last_possible_match = NULL;
+            char *current_pos = row->chars;
+            while(current_pos < &row->chars[start_char_idx]) {
+                char *found = strstr(current_pos, find_buffer);
+                if (found && found < &row->chars[start_char_idx]) {
+                    last_possible_match = found;
+                    current_pos = found + 1;
                 } else {
-
                     break;
-
                 }
-
             }
-
-            match = last_match_ptr;
-
+            match = last_possible_match;
         }
-
-
 
         if (match) {
-
-            last_match_cy = row_idx;
-
+            last_match_cy = current_row_idx;
             last_match_cx = match - row->chars;
-
-            E.cy = row_idx;
-
+            E.cy = current_row_idx;
             E.cx = last_match_cx;
-
             editorScroll();
-
             return;
-
         }
-
     }
-
 }
 
 void editorFind() {
@@ -1712,6 +1702,7 @@ void editorGoToLine() {
   if (line_num > 0 && line_num <= E.numrows) {
     E.cy = line_num - 1;
     E.cx = 0;
+    editorSetStatusMessage("%d行目に移動しました", line_num);
   } else {
     editorSetStatusMessage("無効な行番号です: %d", line_num);
   }
@@ -1918,17 +1909,19 @@ void editorDrawMessageBar(struct abuf *ab) {
   }
 }
 
-void editorRefreshScreen() {
-  write(STDOUT_FILENO, "\x1b[2J", 4);
-  write(STDOUT_FILENO, "\x1b[H", 3);
-  editorScroll();
-  struct abuf ab = ABUF_INIT;
+void editorUpdateScreenContent(struct abuf *current_frame, struct abuf *prev_frame);
 
-  abAppend(&ab, "\x1b[?25l", 6);
+void editorRefreshScreen() {
+  editorScroll();
   
-  editorDrawStatusBar(&ab);
-  editorDrawRows(&ab);
-  editorDrawMessageBar(&ab);
+  struct abuf current_frame_ab = ABUF_INIT;
+
+  abAppend(&current_frame_ab, "\x1b[?25l", 6); // Hide cursor
+  abAppend(&current_frame_ab, "\x1b[H", 3);    // Cursor to top-left
+
+  editorDrawStatusBar(&current_frame_ab);
+  editorDrawRows(&current_frame_ab);
+  editorDrawMessageBar(&current_frame_ab);
   
   int line_num_width = 0;
   if (E.syntax) {
@@ -1943,12 +1936,104 @@ void editorRefreshScreen() {
 
   char buf[32];
   snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 2, (E.rx - E.coloff) + 1 + line_num_width);
-  abAppend(&ab, buf, (size_t)strlen(buf));
+  abAppend(&current_frame_ab, buf, (size_t)strlen(buf));
   
-  abAppend(&ab, "\x1b[?25h", 6);
+  abAppend(&current_frame_ab, "\x1b[?25h", 6); // Show cursor
   
-  write(STDOUT_FILENO, ab.b, ab.len);
-  abFree(&ab);
+  editorUpdateScreenContent(&current_frame_ab, &E.prev_screen_abuf);
+  // current_frame_ab's buffer is now owned by E.prev_screen_abuf, so don't free it.
+  current_frame_ab.b = NULL;
+  current_frame_ab.len = 0;
+  abFree(&current_frame_ab);
+}
+
+void editorUpdateScreenContent(struct abuf *current_frame, struct abuf *prev_frame) {
+    // If it's the first draw or the previous frame is empty, draw everything
+    if (prev_frame->b == NULL || prev_frame->len == 0) {
+        write(STDOUT_FILENO, current_frame->b, current_frame->len);
+    } else {
+        struct abuf diff_output = ABUF_INIT;
+
+        // Offsets to iterate through the buffers
+        size_t curr_offset = 0;
+        size_t prev_offset = 0;
+
+        // Line numbers for cursor positioning
+        int row = 1; // Terminal rows are 1-indexed
+
+        // Iterate line by line
+        // Loop as long as there is content in either buffer
+        while (curr_offset < current_frame->len || prev_offset < prev_frame->len) {
+            // Determine the start and length of the current line in current_frame
+            size_t curr_line_start_offset = curr_offset;
+            size_t curr_line_end_offset = curr_offset;
+            while (curr_line_end_offset < current_frame->len && current_frame->b[curr_line_end_offset] != '\n') {
+                curr_line_end_offset++;
+            }
+            // Include the newline character in the length for display purposes, but exclude for comparison
+            size_t curr_line_total_len = curr_line_end_offset - curr_line_start_offset;
+            size_t curr_line_cmp_len = curr_line_total_len;
+            if (curr_line_end_offset < current_frame->len && current_frame->b[curr_line_end_offset] == '\n') {
+                curr_line_total_len++; // Include newline in total length
+            }
+
+            // Determine the start and length of the current line in prev_frame
+            size_t prev_line_start_offset = prev_offset;
+            size_t prev_line_end_offset = prev_offset;
+            while (prev_line_end_offset < prev_frame->len && prev_frame->b[prev_line_end_offset] != '\n') {
+                prev_line_end_offset++;
+            }
+            // Include the newline character in the length for display purposes, but exclude for comparison
+            size_t prev_line_total_len = prev_line_end_offset - prev_line_start_offset;
+            size_t prev_line_cmp_len = prev_line_total_len;
+            if (prev_line_end_offset < prev_frame->len && prev_frame->b[prev_line_end_offset] == '\n') {
+                prev_line_total_len++; // Include newline in total length
+            }
+            
+            // Compare lines: check length first, then content
+            // If one buffer has run out of lines, they are considered different
+            bool lines_are_different = false;
+            if (curr_line_cmp_len != prev_line_cmp_len) { // Length difference
+                lines_are_different = true;
+            } else if (curr_offset >= current_frame->len || prev_offset >= prev_frame->len) { // One buffer exhausted
+                lines_are_different = true;
+            } else if (curr_line_cmp_len > 0 && strncmp(current_frame->b + curr_line_start_offset,
+                                                        prev_frame->b + prev_line_start_offset,
+                                                        curr_line_cmp_len) != 0) {
+                lines_are_different = true;
+            }
+
+            if (lines_are_different) {
+                // Lines are different, redraw the current line
+                char cmd[32];
+                int cmdlen = snprintf(cmd, sizeof(cmd), "\x1b[%d;1H", row); // Move to start of line
+                abAppend(&diff_output, cmd, cmdlen);
+                abAppend(&diff_output, "\x1b[K", 3); // Clear to end of line
+                // Only write content from current_frame if it exists for this line
+                if (curr_line_start_offset < current_frame->len) {
+                    abAppend(&diff_output, current_frame->b + curr_line_start_offset, curr_line_total_len);
+                }
+            }
+
+            // Advance offsets to the beginning of the next line
+            // Handle case where line is empty (just a newline) or last line without newline
+            curr_offset = curr_line_start_offset + curr_line_total_len;
+            prev_offset = prev_line_start_offset + prev_line_total_len;
+            
+            row++;
+        }
+        write(STDOUT_FILENO, diff_output.b, diff_output.len);
+        abFree(&diff_output);
+    }
+
+    // After writing, update prev_frame for the next cycle
+    abFree(prev_frame); // Free old prev_frame content
+
+    // Transfer ownership of current_frame's buffer to prev_frame
+    prev_frame->b = current_frame->b;
+    prev_frame->len = current_frame->len;
+    current_frame->b = NULL; // Prevent current_frame from freeing this memory
+    current_frame->len = 0;
 }
 
 void editorSetStatusMessage(const char *fmt, ...) {
@@ -2006,34 +2091,32 @@ char *editorPrompt(char *prompt, void (*callback)(int, int)) {
       }
       buflen = strlen(buf);
       active_field = 1 - active_field;
-      if (callback) callback(c, active_field);
       continue;
     }
 
     switch (c) {
       case '\r': // Enter
         if (is_fr_prompt) {
-          if (active_field == 0) {
+          if (active_field == 0) { // In find field
             strncpy(find_buffer, buf, sizeof(find_buffer) - 1);
             find_buffer[sizeof(find_buffer) - 1] = '\0';
-          } else {
+            if (callback) callback(c, active_field);
+
+            editorSetStatusMessage("");
+            free(buf);
+            return strdup(""); // Exit prompt
+          } else { // In replace field
             strncpy(replace_buffer, buf, sizeof(replace_buffer) - 1);
             replace_buffer[sizeof(replace_buffer) - 1] = '\0';
-          }
-          if (active_field == 0 && strlen(replace_buffer) == 0) {
-            editorSetStatusMessage("");
             if (callback) callback(c, active_field);
-            free(buf);
-            return NULL;
+            
+            break; // Keep prompt open
           }
-        }
-        if (callback) callback(c, active_field);
-        
-        if (!is_fr_prompt) {
+        } else {
+           // For other prompts (GoTo, SaveAs), return the buffer content
            editorSetStatusMessage("");
-           return buf;
+           return buf; // Caller is responsible for freeing this
         }
-        break;
 
       case '\x1b': // ESC
         editorSetStatusMessage("");
@@ -2050,7 +2133,6 @@ char *editorPrompt(char *prompt, void (*callback)(int, int)) {
           buflen = i;
           buf[buflen] = '\0';
         }
-        if (callback) callback(c, active_field);
         break;
 
       case ARROW_UP:
@@ -2061,6 +2143,15 @@ char *editorPrompt(char *prompt, void (*callback)(int, int)) {
       case PAGE_DOWN:
       case HOME_KEY:
       case END_KEY:
+        if (is_fr_prompt) {
+          if (active_field == 0) {
+            strncpy(find_buffer, buf, sizeof(find_buffer) - 1);
+            find_buffer[sizeof(find_buffer) - 1] = '\0';
+          } else {
+            strncpy(replace_buffer, buf, sizeof(replace_buffer) - 1);
+            replace_buffer[sizeof(replace_buffer) - 1] = '\0';
+          }
+        }
         if (callback) callback(c, active_field);
         break;
 
@@ -2082,7 +2173,6 @@ char *editorPrompt(char *prompt, void (*callback)(int, int)) {
             buf[buflen++] = (c & 0x3F) | 0x80;
           }
           buf[buflen] = '\0';
-          if (callback) callback(c, active_field);
         }
         break;
     }
@@ -2183,6 +2273,12 @@ void editorMoveCursor(int key) {
   int rowlen = row ? row->size : 0;
   if (E.cx > rowlen) {
     E.cx = rowlen;
+  }
+  // Clamp E.cy to prevent it from going past the last actual row
+  if (E.numrows == 0) {
+      E.cy = 0;
+  } else if (E.cy >= E.numrows) {
+      E.cy = E.numrows - 1;
   }
 
   if (is_shift) {
@@ -2339,16 +2435,8 @@ void editorProcessKeypress() {
               action.data.string.str = text;
               action.data.string.len = len;
               push_undo_action(action);
-            text = NULL;
             }
 
-            size_t sanitized_len = 0;
-            for (size_t i = 0; i < len; i++) {
-              if (isprint(text[i]) || text[i] == '\t' || text[i] == '\n' || text[i] == '\r') {
-                text[sanitized_len++] = text[i];
-              }
-            }
-            text[len] = '\0';
             editorInsertString(text, len);
             free(text);
             editorSetStatusMessage("クリップボードから貼り付けました");
@@ -2395,6 +2483,8 @@ void initEditor() {
   E.redo_capacity = 0;
   E.is_undo_redo = 0;
   E.initial_line = 0;
+  E.prev_screen_abuf.b = NULL;
+  E.prev_screen_abuf.len = 0;
   if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
   E.screenrows -= 2;
 }
