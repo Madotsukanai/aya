@@ -18,8 +18,8 @@
 #include <wchar.h>
 #include <stdbool.h>
 
-#define AYA_VERSION "0.1.0"
-#define AYA_TAB_STOP 8
+#define AYA_VERSION "0.1.1"
+#define AYA_TAB_STOP 4
 #define AYA_QUIT_TIMES 3
 
 #define CTRL_KEY(k) ((k) & 0x1f)
@@ -89,43 +89,43 @@ char *C_HL_keywords[] = {
 
 char *cpp_HL_extensions[] = { ".cpp", ".hpp", ".cc", ".hh", NULL };
 char *cpp_HL_keywords[] = {
-    "switch", "if", "while", "for", "break", "continue", "return", "else",
-    "struct", "union", "typedef", "static", "enum", "case", "const",
-    "volatile", "extern", "register", "sizeof", "goto", "do", "default",
-    "class", "public", "private", "protected", "template", "typename",
-    "try", "catch", "throw", "new", "delete", "this", "friend", "virtual",
-    "namespace", "using", "explicit", "operator", "asm", "export", "inline",
-    "mutable", "reinterpret_cast", "static_cast", "const_cast", "dynamic_cast",
-    "typeid", "wchar_t",
+  "switch", "if", "while", "for", "break", "continue", "return", "else",
+  "struct", "union", "typedef", "static", "enum", "case", "const",
+  "volatile", "extern", "register", "sizeof", "goto", "do", "default",
+  "class", "public", "private", "protected", "template", "typename",
+  "try", "catch", "throw", "new", "delete", "this", "friend", "virtual",
+  "namespace", "using", "explicit", "operator", "asm", "export", "inline",
+  "mutable", "reinterpret_cast", "static_cast", "const_cast", "dynamic_cast",
+  "typeid", "wchar_t",
 
-    "int|", "long|", "double|", "float|", "char|", "unsigned|", "signed|",
-    "void|", "short|", "bool|", "auto|", "decltype|",
-    "true|", "false|", "nullptr|", NULL
+  "int|", "long|", "double|", "float|", "char|", "unsigned|", "signed|",
+  "void|", "short|", "bool|", "auto|", "decltype|",
+  "true|", "false|", "nullptr|", NULL
 };
 
 char *makefile_HL_extensions[] = { "makefile", "Makefile", NULL };
 char *makefile_HL_keywords[] = {
-    "define", "endef", "ifeq", "ifneq", "ifdef", "ifndef", "else", "endif",
-    "include", "sinclude", "override", "export", "unexport", "vpath",
+  "define", "endef", "ifeq", "ifneq", "ifdef", "ifndef", "else", "endif",
+  "include", "sinclude", "override", "export", "unexport", "vpath",
 
-    ".PHONY|", ".DEFAULT|", ".PRECIOUS|", ".INTERMEDIATE|", ".SECONDARY|",
-    ".DELETE_ON_ERROR|", ".LOW_RESOLUTION_TIME|", ".SILENT|", ".IGNORE|",
-    ".NOTPARALLEL|", ".ONESHELL|",
+  ".PHONY|", ".DEFAULT|", ".PRECIOUS|", ".INTERMEDIATE|", ".SECONDARY|",
+  ".DELETE_ON_ERROR|", ".LOW_RESOLUTION_TIME|", ".SILENT|", ".IGNORE|",
+  ".NOTPARALLEL|", ".ONESHELL|",
     
-    ":=|", "+=|", "?=|", "$@|", "$<|", "$^|", "$?|", "$*|", "$+|", NULL
+  ":=|", "+=|", "?=|", "$@|", "$<|", "$^|", "$?|", "$*|", "$+|", NULL
 };
 
 char *python_HL_extensions[] = { ".py", NULL };
 char *python_HL_keywords[] = {
-    "and", "as", "assert", "break", "class", "continue", "def", "del",
-    "elif", "else", "except", "finally", "for", "from", "global",
-    "if", "import", "in", "is", "lambda", "nonlocal", "not", "or",
-    "pass", "raise", "return", "try", "while", "with", "yield",
+  "and", "as", "assert", "break", "class", "continue", "def", "del",
+  "elif", "else", "except", "finally", "for", "from", "global",
+  "if", "import", "in", "is", "lambda", "nonlocal", "not", "or",
+  "pass", "raise", "return", "try", "while", "with", "yield",
 
-    "True|", "False|", "None|", "self|", "cls|",
+  "True|", "False|", "None|", "self|", "cls|",
 
-    "int|", "str|", "list|", "dict|", "set|", "tuple|", "print|", "range|",
-    "len|", "super|", NULL
+  "int|", "str|", "list|", "dict|", "set|", "tuple|", "print|", "range|",
+  "len|", "super|", NULL
 };
 
 struct editorSyntax HLDB[] = {
@@ -172,9 +172,9 @@ enum undoActionType {
 typedef struct {
   enum undoActionType type;
   int cx, cy;
-  union {
+  union {    
     char ch;
-    struct {
+    struct {  
       char *str;
       int len;
     } string;
@@ -264,13 +264,13 @@ void editorUpdateRow(erow *row);
 void editorDelChar();
 void editorScroll();
 void editorReplace();
-
+int indent_unit = -1;
 
 // undo 系関数のプロトタイプ
 void push_action(undoAction **stack, int *count, int *capacity, undoAction action);
 void push_undo_action(undoAction action);
 
-// editorDeleteSelection
+
 char *editorGetSelectedString();
 void editorDeleteSelection();
 
@@ -1034,6 +1034,21 @@ int editorRowRxToCx(erow *row, int rx) {
 }
 
 void editorUpdateRow(erow *row) {
+  // Defensive check: If row->chars is NULL, treat it as an empty row.
+  if (row->chars == NULL) {
+      row->size = 0;
+      // Also ensure render and hl are cleaned up to prevent further issues.
+      free(row->render);
+      row->render = NULL;
+      free(row->hl);
+      row->hl = NULL;
+      free(row->render_to_chars_map);
+      row->render_to_chars_map = NULL;
+      row->rsize = 0;
+      row->hl_open_comment = 0;
+      return; // Nothing to update for a NULL chars row.
+  }
+
   int tabs = 0;
   if (row->size < 0) row->size = 0;
   for (int j = 0; j < row->size; j++) {
@@ -1373,150 +1388,77 @@ void editorInsertNewLine() {
         editorDeleteSelection();
     }
 
-    if (E.cx == 0 && E.cy < E.numrows) {
-        char indent_str[256] = {0};
-        int indent_len = 0;
-        erow *next_row = &E.row[E.cy];
-        while (indent_len < next_row->size &&
-               isspace(next_row->chars[indent_len]) &&
+    char indent_str[256] = {0};
+    int indent_len = 0;
+
+    // --- 現在行を分割して新行を作る ---
+    if (E.cy < E.numrows) {
+        erow *current_row_before_split = &E.row[E.cy];
+        // Populate indent_str and indent_len from the current line's leading whitespace
+        while (indent_len < current_row_before_split->size &&
+               (current_row_before_split->chars[indent_len] == ' ' || current_row_before_split->chars[indent_len] == '\t') &&
                indent_len < (int)sizeof(indent_str) - 1) {
-            indent_str[indent_len] = next_row->chars[indent_len];
+            indent_str[indent_len] = current_row_before_split->chars[indent_len];
             indent_len++;
         }
         indent_str[indent_len] = '\0';
 
-        if (!E.is_undo_redo) {
-            undoAction action;
-            action.type = ACTION_SPLIT_LINE;
-            action.cx = 0;
-            action.cy = E.cy > 0 ? E.cy -1 : 0;
-            if (E.cy > 0) {
-              erow *prev_row = &E.row[E.cy - 1];
-              action.cx = prev_row->size;
-              action.data.string.str = "";
-              action.data.string.len = 0;
 
-            } else {
-               action.data.string.str = "";
-               action.data.string.len = 0;
-            }
-             push_undo_action(action);
-        }
-
-
-        editorInsertRow(E.cy, indent_str, indent_len);
-        E.cx = indent_len;
-
+        editorInsertRow(E.cy + 1, &current_row_before_split->chars[E.cx], current_row_before_split->size - E.cx);
+        // After editorInsertRow, E.row might have been reallocated. Re-fetch the pointer to the original row.
+        erow *row_after_realloc = &E.row[E.cy];
+        row_after_realloc->size = E.cx;
+        row_after_realloc->chars[row_after_realloc->size] = '\0';
+        editorUpdateRow(row_after_realloc);
     } else {
-        char indent_str[256] = {0};
-        int indent_len = 0;
-        if (E.cy < E.numrows) {
-            erow *current_row = &E.row[E.cy];
-            while (indent_len < current_row->size &&
-                   (current_row->chars[indent_len] == ' ' || current_row->chars[indent_len] == '\t') &&
-                   indent_len < (int)sizeof(indent_str) - 1) {
-                indent_str[indent_len] = current_row->chars[indent_len];
-                indent_len++;
-            }
-            indent_str[indent_len] = '\0';
-        }
+        editorInsertRow(E.numrows, "", 0);
+    }
 
-        if (E.syntax && (strcmp(E.syntax->filetype, "python") == 0 || strcmp(E.syntax->filetype, "c") == 0 || strcmp(E.syntax->filetype, "cpp") == 0)) {
-            if (E.cy < E.numrows) {
-                erow *current_row = &E.row[E.cy];
-                int i = E.cx - 1;
-                while (i >= 0 && isspace(current_row->chars[i])) {
-                    i--;
-                }
-                char trigger_char = 0;
-                if (strcmp(E.syntax->filetype, "python") == 0) {
-                    trigger_char = ':';
+    E.cy++;
+    E.cx = 0;
+
+    // --- ブロック増加時の追加インデント ---
+    if (E.syntax &&
+        (strcmp(E.syntax->filetype, "c") == 0 ||
+         strcmp(E.syntax->filetype, "cpp") == 0 ||
+         strcmp(E.syntax->filetype, "python") == 0)) {
+
+        if (E.cy > 0) {
+            erow *current_row_before_split = &E.row[E.cy -1];
+            int i = E.cx - 1;
+            if (i < 0) i = current_row_before_split->size -1;
+
+            while (i >= 0 && isspace((unsigned char)current_row_before_split->chars[i])) i--;
+            
+            char trigger_char = 0;
+            if (strcmp(E.syntax->filetype, "python") == 0) trigger_char = ':';
+            else trigger_char = '{';
+
+            if (i >= 0 && current_row_before_split->chars[i] == trigger_char) {
+                // Determine whether to use tabs or spaces for this additional indent
+                // Prioritize file-wide preference (indent_unit). If indent_unit is 0,
+                // it implies no clear preference detected, so default to tabs for new/unspecified files.
+                bool should_add_tab_indent_unit = (indent_unit == -1 || indent_unit == 0);
+
+                // Add additional indentation
+                if (should_add_tab_indent_unit) {
+                    editorRowInsertChar(&E.row[E.cy], 0, '\t');
+                    E.cx++;
                 } else {
-                    trigger_char = '{';
-                }
-
-                if (i >= 0 && current_row->chars[i] == trigger_char) {
-                    bool use_tabs = true;
-                    if (indent_len > 0) {
-                        bool has_tabs = false;
-                        for (int k = 0; k < indent_len; k++) {
-                            if (indent_str[k] == '\t') {
-                                has_tabs = true;
-                                break;
-                            }
-                        }
-                        if (!has_tabs) {
-                            use_tabs = false;
-                        }
+                    int spaces_to_add = (indent_unit > 0) ? indent_unit : 4; // Default to 4 spaces
+                    for (int k = 0; k < spaces_to_add; k++) {
+                        editorRowInsertChar(&E.row[E.cy], E.cx + k, ' ');
                     }
-
-                    if (use_tabs) {
-                        if (indent_len + 1 < (int)sizeof(indent_str)) {
-                            indent_str[indent_len++] = '\t';
-                            indent_str[indent_len] = '\0';
-                        }
-                    } else {
-                        int spaces_to_add = 2;
-                        if (indent_len + spaces_to_add < (int)sizeof(indent_str)) {
-                            for (int k = 0; k < spaces_to_add; k++) {
-                                indent_str[indent_len++] = ' ';
-                            }
-                            indent_str[indent_len] = '\0';
-                        }
-                    }
+                    E.cx += spaces_to_add;
                 }
             }
         }
+    }
 
-        if (!E.is_undo_redo) {
-            undoAction action;
-            action.type = ACTION_SPLIT_LINE;
-            action.cx = E.cx;
-            action.cy = E.cy;
-
-            if (E.cy < E.numrows) {
-                erow *row = &E.row[E.cy];
-                if (E.cx <= row->size) {
-                    action.data.string.str = &row->chars[E.cx];
-                    action.data.string.len = row->size - E.cx;
-                } else {
-                    action.data.string.str = "";
-                    action.data.string.len = 0;
-                }
-            } else {
-                action.data.string.str = "";
-                action.data.string.len = 0;
-            }
-            push_undo_action(action);
-        }
-
-        if (E.cy == E.numrows) {
-            editorInsertRow(E.numrows, "", 0);
-        } else {
-            erow *row = &E.row[E.cy];
-            editorInsertRow(E.cy + 1, &row->chars[E.cx], row->size - E.cx);
-            row = &E.row[E.cy];
-            row->size = E.cx;
-            row->chars[row->size] = '\0';
-            editorUpdateRow(row);
-        }
-        E.cy++;
-        E.cx = 0;
-
-        if (indent_len > 0) {
-            editorRowInsertString(&E.row[E.cy], 0, indent_str, indent_len);
-            E.cx = indent_len;
-
-            if (!E.is_undo_redo) {
-                undoAction action;
-                action.type = ACTION_INSERT_STRING;
-                action.cx = 0;
-                action.cy = E.cy;
-                action.data.string.str = indent_str;
-                action.data.string.len = indent_len;
-                push_undo_action(action);
-            }
-        }
+    // Apply base indentation from the previous line.
+    if (indent_len > 0) {
+        editorRowInsertString(&E.row[E.cy], 0, indent_str, indent_len);
+        E.cx = indent_len;
     }
 }
 
@@ -1571,6 +1513,73 @@ void editorDelChar() {
 
 /*** file i/o ***/
 
+int gcd(int a, int b) {
+    while (b) {
+        int temp = b;
+        b = a % b;
+        a = temp;
+    }
+    return a;
+}
+
+int get_line_indent(erow *row) {
+    if (row->size > 0 && row->chars[0] == '\t') {
+        return -1; // Tab indented
+    }
+    int indent = 0;
+    for (int i = 0; i < row->size; i++) {
+        if (row->chars[i] == ' ') {
+            indent++;
+        } else if (row->chars[i] == '\t') {
+            return -1; // Mixed or tab-indented line
+        } else {
+            break;
+        }
+    }
+    return indent;
+}
+
+void detect_indent_unit() {
+    int indent_gcd = 0;
+    int first_indent = -1;
+    int has_space_indent = 0;
+    int tab_indented_lines = 0; // Count lines that are tab-indented
+
+    for (int i = 0; i < E.numrows; i++) {
+        int current_indent = get_line_indent(&E.row[i]);
+        
+        if (current_indent == -1) { // Tab found in leading whitespace
+            tab_indented_lines++;
+            continue; // Continue checking other lines
+        }
+        
+        if (current_indent > 0) {
+            has_space_indent = 1;
+            if (first_indent == -1) first_indent = current_indent;
+
+            if (indent_gcd == 0) {
+                indent_gcd = current_indent;
+            } else {
+                indent_gcd = gcd(indent_gcd, current_indent);
+            }
+        }
+    }
+
+    // Decide based on the majority or clear space indentation
+    if (has_space_indent && tab_indented_lines < E.numrows / 2) { // If space is dominant
+        if (indent_gcd > 1) {
+            indent_unit = indent_gcd;
+        } else if (first_indent > 1) {
+            indent_unit = first_indent;
+        } else {
+            indent_unit = 4; // Default to 4 spaces if unit is not obvious
+        }
+    } else {
+        // Either no space indentation found, or tabs are dominant
+        indent_unit = -1; // Use tabs
+    }
+}
+
 char *editorRowsToString(size_t *buflen) {
   size_t totlen = 0;
   int j;
@@ -1615,6 +1624,7 @@ void editorOpen(char *filename) {
   free(line);
   fclose(fp);
   E.dirty = 0;
+  detect_indent_unit();
 
   if (E.initial_line > 0) {
     E.cy = E.initial_line - 1;
@@ -2015,9 +2025,10 @@ void editorUpdateScreenContent(struct abuf *current_frame, struct abuf *prev_fra
 void editorRefreshScreen() {
   editorScroll();
   
+  write(STDOUT_FILENO, "\x1b[?25l", 6); // Hide cursor before any drawing
+  
   struct abuf current_frame_ab = ABUF_INIT;
 
-  abAppend(&current_frame_ab, "\x1b[?25l", 6);
   abAppend(&current_frame_ab, "\x1b[H", 3);
 
   editorDrawStatusBar(&current_frame_ab);
@@ -2025,9 +2036,8 @@ void editorRefreshScreen() {
   editorDrawMessageBar(&current_frame_ab);
   
   int line_num_width = 0;
-  if (E.syntax) {
+  if (E.syntax && E.numrows > 0) { // Only calculate if there are rows AND syntax is active
       int temp = E.numrows;
-      if (temp == 0) temp = 1;
       while (temp > 0) {
           temp /= 10;
           line_num_width++;
@@ -2036,16 +2046,16 @@ void editorRefreshScreen() {
   }
 
   char buf[32];
-  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 2, (E.rx - E.coloff) + 1 + line_num_width);
+  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1, (E.rx - E.coloff) + 1 + line_num_width);
   abAppend(&current_frame_ab, buf, (size_t)strlen(buf));
-  
-  abAppend(&current_frame_ab, "\x1b[?25h", 6);
   
   editorUpdateScreenContent(&current_frame_ab, &E.prev_screen_abuf);
 
   current_frame_ab.b = NULL;
   current_frame_ab.len = 0;
   abFree(&current_frame_ab);
+
+  write(STDOUT_FILENO, "\x1b[?25h", 6); // Show cursor after all drawing
 }
 
 void editorUpdateScreenContent(struct abuf *current_frame, struct abuf *prev_frame) {
