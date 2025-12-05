@@ -21,6 +21,7 @@
 #define AYA_VERSION "0.1.0"
 #define AYA_TAB_STOP 8
 #define AYA_QUIT_TIMES 3
+#define LINE_NUM_SPACES 2 // Fixed spaces between line number and content
 
 #define CTRL_KEY(k) ((k) & 0x1f)
 
@@ -1723,15 +1724,15 @@ void editorScroll() {
     E.rowoff = E.cy - E.screenrows + 1;
   }
 
-  int line_num_width = 0;
-  int temp = E.numrows;
-  while (temp > 0) {
-    temp /= 10;
-    line_num_width++;
+  int line_num_digits = 0;
+  int temp_num_rows_scroll = E.numrows;
+  if (temp_num_rows_scroll == 0) temp_num_rows_scroll = 1;
+  while (temp_num_rows_scroll > 0) {
+    temp_num_rows_scroll /= 10;
+    line_num_digits++;
   }
-  if (line_num_width == 0) line_num_width = 1;
-  line_num_width += 1; // for space
-  int effective_screencols = E.screencols - line_num_width;
+  int line_num_area_width = line_num_digits + LINE_NUM_SPACES;
+  int effective_screencols = E.screencols - line_num_area_width;
 
   if (E.rx < E.coloff) {
     E.coloff = E.rx;
@@ -1743,14 +1744,14 @@ void editorScroll() {
 
 void editorDrawRows(struct abuf *ab) {
   int y;
-  int line_num_width = 0;
-  int temp = E.numrows;
-  while (temp > 0) {
-    temp /= 10;
-    line_num_width++;
+  int line_num_digits = 0;
+  int temp_num_rows = E.numrows;
+  if (temp_num_rows == 0) temp_num_rows = 1; // Handle empty file case for line number 1
+  while (temp_num_rows > 0) {
+    temp_num_rows /= 10;
+    line_num_digits++;
   }
-  if (line_num_width == 0) line_num_width = 1;
-  line_num_width += 1; // for space
+  int line_num_area_width = line_num_digits + LINE_NUM_SPACES;
 
   for (y = 0; y < E.screenrows; y++) {
     int filerow = y + E.rowoff;
@@ -1771,12 +1772,15 @@ void editorDrawRows(struct abuf *ab) {
         abAppend(ab, "~", 1);
       }
     } else {
-      char line_num_str[16];
-      int len = snprintf(line_num_str, sizeof(line_num_str), "%*d ", line_num_width -1, filerow + 1);
-      abAppend(ab, "\x1b[38;5;240m", 11);
-      abAppend(ab, line_num_str, (size_t)len);
-      abAppend(ab, "\x1b[39m", 5);
-
+              char line_num_str[16];
+              int len = snprintf(line_num_str, sizeof(line_num_str), "%*d", line_num_digits, filerow + 1);
+              abAppend(ab, "\x1b[38;5;240m", 11);
+              abAppend(ab, line_num_str, (size_t)len);
+              // Explicitly add padding spaces
+              for (int i = 0; i < LINE_NUM_SPACES; i++) {
+                abAppend(ab, " ", 1);
+              }
+              abAppend(ab, "\x1b[39m", 5);
       erow *row = &E.row[filerow];
       int rx = 0;
       int current_color_applied = 39;
@@ -1785,7 +1789,7 @@ void editorDrawRows(struct abuf *ab) {
       int start_col = E.syntax ? E.coloff : E.coloff;
       if (start_col < 0) start_col = 0;
       
-      int screen_width = E.syntax ? E.screencols - line_num_width : E.screencols;
+      int screen_width = E.screencols - line_num_area_width;
 
       for (int j = 0; j < row->rsize; ) {
           int char_len = utf8_char_len_from_byte(row->render[j]);
@@ -1916,19 +1920,17 @@ void editorRefreshScreen() {
   editorDrawRows(&current_frame_ab);
   editorDrawMessageBar(&current_frame_ab);
   
-  int line_num_width = 0;
-  if (E.syntax) {
-      int temp = E.numrows;
-      if (temp == 0) temp = 1;
-      while (temp > 0) {
-          temp /= 10;
-          line_num_width++;
-      }
-      line_num_width += 1;
+  int line_num_digits = 0;
+  int temp_num_rows_refresh = E.numrows;
+  if (temp_num_rows_refresh == 0) temp_num_rows_refresh = 1;
+  while (temp_num_rows_refresh > 0) {
+    temp_num_rows_refresh /= 10;
+    line_num_digits++;
   }
+  int line_num_area_width = line_num_digits + LINE_NUM_SPACES;
 
   char buf[32];
-  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 2, (E.rx - E.coloff) + 1 + line_num_width);
+  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 2, (E.rx - E.coloff) + 1 + line_num_area_width);
   abAppend(&current_frame_ab, buf, (size_t)strlen(buf));
   
   abAppend(&current_frame_ab, "\x1b[?25h", 6); // Show cursor
