@@ -18,11 +18,10 @@
 #include <wchar.h>
 #include <stdbool.h>
 
-#define AYA_VERSION "0.1.0"
-#define AYA_TAB_STOP 8
+#define AYA_VERSION "0.1.1"
+#define AYA_TAB_STOP 4
 #define AYA_QUIT_TIMES 3
-#define LINE_NUM_SPACES 2 // Fixed spaces between line number and content
-
+#define LINE_NUM_COLUMNS 4
 #define CTRL_KEY(k) ((k) & 0x1f)
 
 enum editorKey {
@@ -265,13 +264,8 @@ void editorUpdateRow(erow *row);
 void editorDelChar();
 void editorScroll();
 void editorReplace();
-
-
-// undo 系関数のプロトタイプ
 void push_action(undoAction **stack, int *count, int *capacity, undoAction action);
 void push_undo_action(undoAction action);
-
-// editorDeleteSelection
 char *editorGetSelectedString();
 void editorDeleteSelection();
 
@@ -295,9 +289,9 @@ void die(const char *s) {
 void disableRawMode() {
   if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.orig_termios) == -1)
     die("tcsetattr");
-  write(STDOUT_FILENO, "\x1b[?1006l", 8); // Disable SGR mouse mode
-  write(STDOUT_FILENO, "\x1b[?1000l", 8); // Disable normal mouse reporting
-  write(STDOUT_FILENO, "\x1b[?1049l", 6); // Exit alternate screen buffer
+  write(STDOUT_FILENO, "\x1b[?1006l", 8);
+  write(STDOUT_FILENO, "\x1b[?1000l", 8);
+  write(STDOUT_FILENO, "\x1b[?1049l", 6);
 }
 
 void enableRawMode() {
@@ -311,9 +305,9 @@ void enableRawMode() {
   raw.c_cc[VMIN] = 0;
   raw.c_cc[VTIME] = 1;
   if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) die("tcsetattr");
-  write(STDOUT_FILENO, "\x1b[?1000h", 8); // Enable normal mouse reporting
-  write(STDOUT_FILENO, "\x1b[?1006h", 8); // Enable SGR mouse mode
-  write(STDOUT_FILENO, "\x1b[?1049h", 6); // Enter alternate screen buffer
+  write(STDOUT_FILENO, "\x1b[?1000h", 8);
+  write(STDOUT_FILENO, "\x1b[?1006h", 8);
+  write(STDOUT_FILENO, "\x1b[?1049h", 6);
 }
 
 int editorReadKey() {
@@ -334,7 +328,7 @@ int editorReadKey() {
       }
       i++;
     }
-    if (i == 0) { // If only ESC was read
+    if (i == 0) {
         return '\x1b';
     }
     seq[i] = '\0';
@@ -469,28 +463,24 @@ void editorUpdateSyntax(erow *row) {
       memset(row->hl, HL_NORMAL, row->rsize);
     if (E.syntax == NULL) return;
 
-    // Makefile specific highlighting
     if (strcmp(E.syntax->filetype, "makefile") == 0) {
-        // Highlight commands (lines starting with a tab)
         if (row->size > 0 && row->chars[0] == '\t') {
             memset(row->hl, HL_MLCOMMENT, row->rsize);
         }
 
-        // Highlight targets (e.g., `target:`)
         char *colon = strchr(row->render, ':');
         char *equal = strpbrk(row->render, "=?");
         if (colon && (!equal || colon < equal)) {
             memset(row->hl, HL_KEYWORD1, colon - row->render);
         }
 
-        // Highlight variable expansions like $(VAR)
         for (int i = 0; i < row->rsize - 1; i++) {
             if (row->render[i] == '$' && row->render[i+1] == '(') {
                 int j = i + 2;
                 while (j < row->rsize && row->render[j] != ')') {
                     j++;
                 }
-                if (j < row->rsize) { // Found closing paren
+                if (j < row->rsize) {
                     memset(&row->hl[i], HL_PREPROC, j - i + 1);
                 }
                 i = j;
@@ -512,17 +502,15 @@ void editorUpdateSyntax(erow *row) {
         while (i < row->rsize) {
             char c = row->render[i];
             unsigned char prev_hl = (i > 0) ? row->hl[i - 1] : HL_NORMAL;
-    
-            // Handle preprocessor directives (C/C++ specific)
+
             if (E.syntax != NULL && (strcmp(E.syntax->filetype, "c") == 0 || strcmp(E.syntax->filetype, "cpp") == 0) && c == '#' && i == 0) {
                 int start_i = i;
-                memset(&row->hl[start_i], HL_PREPROC, row->rsize - start_i); // Default to HL_PREPROC for the whole line
+                memset(&row->hl[start_i], HL_PREPROC, row->rsize - start_i);
     
-                // Find the directive word (e.g., "include", "define")
-                int j = start_i + 1; // Skip '#'
-                while (j < row->rsize && isspace(row->render[j])) j++; // Skip whitespace
+                int j = start_i + 1;
+                while (j < row->rsize && isspace(row->render[j])) j++;
                 int directive_start = j;
-                while (j < row->rsize && isalpha(row->render[j])) j++; // Read directive word
+                while (j < row->rsize && isalpha(row->render[j])) j++;
                 int directive_end = j;
     
                 char directive[32];
@@ -700,8 +688,8 @@ void editorSelectSyntaxHighlight() {
 int editorSyntaxToColor(int hl) {
   switch (hl) {
     case HL_PREPROC: return 35;
-    case HL_COMMENT:
-    case HL_MLCOMMENT: return 92;
+    case HL_COMMENT: return 32;
+    case HL_MLCOMMENT: return 32;
     case HL_KEYWORD1: return 34;
     case HL_KEYWORD2: return 36;
     case HL_STRING: return 33;
@@ -1724,14 +1712,7 @@ void editorScroll() {
     E.rowoff = E.cy - E.screenrows + 1;
   }
 
-  int line_num_digits = 0;
-  int temp_num_rows_scroll = E.numrows;
-  if (temp_num_rows_scroll == 0) temp_num_rows_scroll = 1;
-  while (temp_num_rows_scroll > 0) {
-    temp_num_rows_scroll /= 10;
-    line_num_digits++;
-  }
-  int line_num_area_width = line_num_digits + LINE_NUM_SPACES;
+  int line_num_area_width = LINE_NUM_COLUMNS + 1;
   int effective_screencols = E.screencols - line_num_area_width;
 
   if (E.rx < E.coloff) {
@@ -1744,14 +1725,7 @@ void editorScroll() {
 
 void editorDrawRows(struct abuf *ab) {
   int y;
-  int line_num_digits = 0;
-  int temp_num_rows = E.numrows;
-  if (temp_num_rows == 0) temp_num_rows = 1; // Handle empty file case for line number 1
-  while (temp_num_rows > 0) {
-    temp_num_rows /= 10;
-    line_num_digits++;
-  }
-  int line_num_area_width = line_num_digits + LINE_NUM_SPACES;
+  int line_num_area_width = LINE_NUM_COLUMNS + 1; // +1 for the separator '|'
 
   for (y = 0; y < E.screenrows; y++) {
     int filerow = y + E.rowoff;
@@ -1773,13 +1747,10 @@ void editorDrawRows(struct abuf *ab) {
       }
     } else {
               char line_num_str[16];
-              int len = snprintf(line_num_str, sizeof(line_num_str), "%*d", line_num_digits, filerow + 1);
+              int len = snprintf(line_num_str, sizeof(line_num_str), "%*d", LINE_NUM_COLUMNS, filerow + 1);
               abAppend(ab, "\x1b[38;5;240m", 11);
               abAppend(ab, line_num_str, (size_t)len);
-              // Explicitly add padding spaces
-              for (int i = 0; i < LINE_NUM_SPACES; i++) {
-                abAppend(ab, " ", 1);
-              }
+              abAppend(ab, "|", 1); // Add separator
               abAppend(ab, "\x1b[39m", 5);
       erow *row = &E.row[filerow];
       int rx = 0;
@@ -1920,14 +1891,7 @@ void editorRefreshScreen() {
   editorDrawRows(&current_frame_ab);
   editorDrawMessageBar(&current_frame_ab);
   
-  int line_num_digits = 0;
-  int temp_num_rows_refresh = E.numrows;
-  if (temp_num_rows_refresh == 0) temp_num_rows_refresh = 1;
-  while (temp_num_rows_refresh > 0) {
-    temp_num_rows_refresh /= 10;
-    line_num_digits++;
-  }
-  int line_num_area_width = line_num_digits + LINE_NUM_SPACES;
+  int line_num_area_width = LINE_NUM_COLUMNS + 1;
 
   char buf[32];
   snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 2, (E.rx - E.coloff) + 1 + line_num_area_width);
@@ -2513,7 +2477,7 @@ int main(int argc, char *argv[]) {
     } else if (strcmp(argv[i], "-l") == 0) {
       if (i + 1 < argc) {
         initial_line = atoi(argv[i + 1]);
-        i++; // Skip the line number argument
+        i++;
       } else {
         fprintf(stderr, "エラー: -l オプションには行番号が必要です。\n");
         return 1;
