@@ -21,7 +21,7 @@
 #define AYA_VERSION "0.1.1"
 #define AYA_TAB_STOP 4
 #define AYA_QUIT_TIMES 3
-#define LINE_NUM_COLUMNS 4
+#define LINE_NUM_COLUMNS 6
 #define CTRL_KEY(k) ((k) & 0x1f)
 
 enum editorKey {
