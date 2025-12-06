@@ -770,7 +770,14 @@ void clear_undo_stack(undoAction **stack, int *count, int *capacity) {
     *capacity = 0;
 }
 
-
+static char *undo_strdup(const char *src, int len) {
+    if (src == NULL || len <= 0) return NULL;
+    char *dst = malloc(len + 1);
+    if (!dst) return NULL;
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+    return dst;
+}
 
 void editorRedo();
 
@@ -809,115 +816,137 @@ void editorUndo() {
 
     E.is_undo_redo = 1;
 
+    /* pop undo action */
     E.undo_count--;
     undoAction action = E.undo_stack[E.undo_count];
 
+    /* move to redo stack (ownership transferred) */
     push_action(&E.redo_stack, &E.redo_count, &E.redo_capacity, action);
+    E.undo_stack[E.undo_count].data.string.str = NULL;
 
-    if (action.type == ACTION_DELETE_STRING ||
-        action.type == ACTION_INSERT_STRING ||
-        action.type == ACTION_JOIN_LINES ||
-        action.type == ACTION_SPLIT_LINE) {
-        /* 元の undo_stack 側の pointer を無効化 */
-        E.undo_stack[E.undo_count].data.string.str = NULL;
-    }
-
+    /* move cursor to action point */
     E.cx = action.cx;
     E.cy = action.cy;
 
     switch (action.type) {
 
-        case ACTION_INSERT_CHAR: {
-            editorRowDelChar(&E.row[action.cy], action.cx, 1);
-            break;
-        }
+    /* ------------------------- */
+    case ACTION_INSERT_CHAR: /* undo: delete inserted char */
+        editorRowDelChar(&E.row[action.cy], action.cx, 1);
+        break;
 
-        case ACTION_DELETE_CHAR: {
-            editorRowInsertChar(&E.row[action.cy], action.cx, action.data.ch);
-            E.cx++;
-            break;
-        }
+    /* ------------------------- */
+    case ACTION_DELETE_CHAR: /* undo: restore deleted char */
+        editorRowInsertChar(&E.row[action.cy], action.cx, action.data.ch);
+        E.cx++;
+        break;
 
-        case ACTION_SPLIT_LINE: {
-            /* join の復元 */
-            char *tmp = strdup(E.row[action.cy + 1].chars);
-            int len = E.row[action.cy + 1].size;
+    /* ------------------------- */
+    case ACTION_SPLIT_LINE: { /* undo split → join back */
+        erow *row = &E.row[action.cy];
 
-            editorRowAppendString(&E.row[action.cy], tmp, len);
-            editorDelRow(action.cy + 1);
+        /* append next row content */
+        editorRowAppendString(row,
+            E.row[action.cy + 1].chars,
+            E.row[action.cy + 1].size);
 
-            free(tmp);
-            break;
-        }
+        /* delete the next row */
+        editorDelRow(action.cy + 1);
 
-        case ACTION_JOIN_LINES: {
-            /* split の復元 */
-            erow *r = &E.row[action.cy];
-            editorInsertRow(action.cy + 1, action.data.string.str,
-                            action.data.string.len);
-
-            /* 重要：DelRow後はポインタを取り直す */
-            r = &E.row[action.cy];
-            r->size = action.cx;
-            r->chars[action.cx] = '\0';
-            editorUpdateRow(r);
-
-            E.cy++;
-            E.cx = 0;
-            break;
-        }
-
-        case ACTION_INSERT_STRING: {
-            /* 削除を戻す（文字列挿入） */
-            editorInsertString(action.data.string.str,
-                               action.data.string.len);
-            break;
-        }
-
-        case ACTION_DELETE_STRING: {
-            /* 挿入を戻す（削除） */
-            int end_y = action.cy;
-            int end_x = action.cx;
-
-            for (int i = 0; i < action.data.string.len; i++) {
-                if (action.data.string.str[i] == '\n') {
-                    end_y++;
-                    end_x = 0;
-                } else {
-                    end_x++;
-                }
-            }
-
-            if (action.cy == end_y) {
-                /* same line */
-                erow *row = &E.row[action.cy];
-                memmove(&row->chars[action.cx],
-                        &row->chars[end_x],
-                        row->size - end_x + 1);
-                row->size -= (end_x - action.cx);
-                editorUpdateRow(row);
-
-            } else {
-                /* multi-line */
-                erow *start = &E.row[action.cy];
-                erow *end   = &E.row[end_y];
-
-                if (end_x > end->size) end_x = end->size;
-
-                char *after = strdup(&end->chars[end_x]);
-
-                start->size = action.cx;
-                editorRowAppendString(start, after, strlen(after));
-                free(after);
-
-                for (int i = action.cy + 1; i <= end_y; i++) {
-                    editorDelRow(action.cy + 1);
-                }
-            }
-
-            break;
-        }
+        break;
     }
+
+    /* ------------------------- */
+    case ACTION_JOIN_LINES: { /* undo join → split back */
+
+        /*
+            1) insertRow may realloc E.row.
+            2) ALWAYS reacquire row pointer after that.
+        */
+
+        editorInsertRow(action.cy + 1,
+                        action.data.string.str,
+                        action.data.string.len);
+
+        /* reacquire pointer (IMPORTANT!!) */
+        erow *row = &E.row[action.cy];
+
+        /* restore truncated first line */
+        row->size = action.cx;
+        row->chars[row->size] = '\0';
+        editorUpdateRow(row);
+
+        E.cy++;
+        E.cx = 0;
+        break;
+    }
+
+    /* ------------------------- */
+    case ACTION_INSERT_STRING: { /* undo string insertion */
+        int end_y = action.cy;
+        int end_x = action.cx;
+
+        /* compute final cursor pos after insertion */
+        for (int i = 0; i < action.data.string.len; i++) {
+            if (action.data.string.str[i] == '\n') {
+                end_y++;
+                end_x = 0;
+            } else {
+                end_x++;
+            }
+        }
+
+        if (end_y == action.cy) {
+            /* single line case */
+            erow *row = &E.row[action.cy];
+            int remove_len = end_x - action.cx;
+            memmove(&row->chars[action.cx],
+                    &row->chars[end_x],
+                    row->size - end_x + 1);
+            row->size -= remove_len;
+            editorUpdateRow(row);
+        } else {
+            /* multi-line case */
+            erow *start = &E.row[action.cy];
+            erow *end = &E.row[end_y];
+
+            if (end_x > end->size) end_x = end->size;
+
+            char *remain = strdup(&end->chars[end_x]);
+
+            start->size = action.cx;
+            editorRowAppendString(start, remain, strlen(remain));
+            free(remain);
+
+            /* delete created rows */
+            for (int i = action.cy + 1; i <= end_y; i++) {
+                editorDelRow(action.cy + 1);
+            }
+        }
+
+        break;
+    }
+
+    /* ------------------------- */
+    case ACTION_DELETE_STRING: { /* undo delete → reinsert */
+        char *s = action.data.string.str;
+        int len = action.data.string.len;
+
+        int cy = action.cy;
+        int cx = action.cx;
+
+        for (int i = 0; i < len; i++) {
+            if (s[i] == '\n') {
+                editorInsertNewLine();
+            } else {
+                editorRowInsertChar(&E.row[E.cy], E.cx, s[i]);
+                E.cx++;
+            }
+        }
+        break;
+    }
+
+    } /* end switch */
 
     E.is_undo_redo = 0;
     E.dirty++;
